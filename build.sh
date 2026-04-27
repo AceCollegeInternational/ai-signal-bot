@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # Fail fast if unresolved merge-conflict markers exist in source files.
-if rg -n "^(<<<<<<<|=======|>>>>>>>)" --glob "*.py" --glob "*.yaml" --glob "*.yml" --glob "*.md" . >/tmp/conflicts.txt; then
+find . -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" \) -print0 \
+  | xargs -0 -r grep -nE "^(<<<<<<<|=======|>>>>>>>)" >/tmp/conflicts.txt || true
+
+if [ -s /tmp/conflicts.txt ]; then
   echo "❌ Unresolved merge conflict markers found:"
   cat /tmp/conflicts.txt
   exit 1
