@@ -1,0 +1,51 @@
+# ─── Core Exchange & Data ────────────────────────────────────────────────────
+ccxt==4.3.95
+# ccxt.pro==4.3.95      # requires private license - comment out if not using
+pandas==2.3.2
+numpy==2.2.6
+pyarrow==20.0.0       # fast parquet caching
+
+# ─── AI Providers ─────────────────────────────────────────────────────────────
+anthropic==0.29.0
+google-generativeai==0.8.3
+groq==1.1.1
+
+# ─── Configuration & Environment ─────────────────────────────────────────────
+python-dotenv==1.0.1
+pyyaml==6.0.1
+
+# ─── API Server ──────────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn==0.30.1
+
+# ─── Async Networking ────────────────────────────────────────────────────────
+aiohttp==3.9.5
+websockets==12.0
+requests==2.32.3
+
+# ─── Backtesting ─────────────────────────────────────────────────────────────
+
+# ─── Plotting / Reports ──────────────────────────────────────────────────────
+plotly==5.22.0
+kaleido==0.2.1        # static image export for plotly
+
+# ─── CLI Dashboard ───────────────────────────────────────────────────────────
+rich==13.7.1
+
+# ─── Telegram Alerts ─────────────────────────────────────────────────────────
+python-telegram-bot==21.3
+
+# ─── Utility / Time ──────────────────────────────────────────────────────────
+pytz==2024.1
+python-dateutil==2.9.0
+schedule==1.2.1
+
+# ─── vectorbt dependencies (vectorbt is installed via build.sh --no-deps) ─────
+scipy
+scikit-learn
+matplotlib
+dateparser
+dill
+imageio
+ipywidgets>=7.0.0
+mypy_extensions

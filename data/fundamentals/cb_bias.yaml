@@ -1,0 +1,11 @@
+updated_at: "2026-03-30T00:00:00Z"
+notes: "Manual fallback CB bias scores. Update after major central bank decisions."
+currencies:
+  USD: 0.25
+  EUR: -0.05
+  GBP: 0.10
+  JPY: -0.20
+  CHF: -0.10
+symbols:
+  XAUUSD:
+    score: -0.20
