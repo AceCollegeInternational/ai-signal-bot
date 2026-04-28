@@ -19,6 +19,8 @@ Usage:
 """
 
 import time
+import csv
+import json
 import os
 import requests
 from dataclasses import dataclass, field
@@ -223,6 +225,9 @@ class ExecutionEngine:
 
         self.paper_portfolio = PaperPortfolio(initial_balance, commission)
         self.order_history: List[OrderResult] = []
+        self.filled_orders_log_path = os.path.join("logs", "filled_orders.jsonl")
+        self.filled_orders_csv_path = os.path.join("logs", "filled_orders.csv")
+        self._init_filled_orders_log()
 
         log.info(f"ExecutionEngine initialised — mode={self.mode}")
 
@@ -264,6 +269,13 @@ class ExecutionEngine:
 
         if result.status == "filled":
             self.order_history.append(result)
+            self._log_filled_order(
+                order=result,
+                event_type="entry",
+                mode=self.mode,
+                risk_amount=sizing.risk_amount,
+                lot_size=(sizing.position_size / 100_000),
+            )
             log.info(f"Order filled: {result.order_id} @ {result.price:.4f}")
         else:
             log.warning(f"Order not filled: {result.status}")
@@ -303,7 +315,94 @@ class ExecutionEngine:
 
         if result.status == "filled":
             self.order_history.append(result)
+            self._log_filled_order(
+                order=result,
+                event_type="exit",
+                mode=self.mode,
+                risk_amount=0.0,
+                lot_size=(amount / 100_000),
+                reason=reason,
+            )
         return result
+
+    def _init_filled_orders_log(self) -> None:
+        """Create fill log files (JSONL + CSV header) if missing."""
+        os.makedirs("logs", exist_ok=True)
+        if not os.path.exists(self.filled_orders_csv_path):
+            with open(self.filled_orders_csv_path, mode="w", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(
+                    [
+                        "timestamp_utc",
+                        "event_type",
+                        "order_id",
+                        "symbol",
+                        "side",
+                        "price",
+                        "amount",
+                        "lot_size",
+                        "risk_amount",
+                        "fees",
+                        "status",
+                        "mode",
+                        "is_paper",
+                        "reason",
+                    ]
+                )
+
+    def _log_filled_order(
+        self,
+        order: OrderResult,
+        event_type: str,
+        mode: str,
+        risk_amount: float,
+        lot_size: float,
+        reason: str = "",
+    ) -> None:
+        """Persist each filled order to append-only JSONL and CSV logs."""
+        try:
+            row = {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "event_type": event_type,
+                "order_id": order.order_id,
+                "symbol": order.symbol,
+                "side": order.side,
+                "price": round(order.price, 6),
+                "amount": round(order.amount, 8),
+                "lot_size": round(lot_size, 4),
+                "risk_amount": round(risk_amount, 2),
+                "fees": round(order.fees, 6),
+                "status": order.status,
+                "mode": mode,
+                "is_paper": order.is_paper,
+                "reason": reason,
+            }
+
+            with open(self.filled_orders_log_path, mode="a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+
+            with open(self.filled_orders_csv_path, mode="a", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(
+                    [
+                        row["timestamp_utc"],
+                        row["event_type"],
+                        row["order_id"],
+                        row["symbol"],
+                        row["side"],
+                        row["price"],
+                        row["amount"],
+                        row["lot_size"],
+                        row["risk_amount"],
+                        row["fees"],
+                        row["status"],
+                        row["mode"],
+                        row["is_paper"],
+                        row["reason"],
+                    ]
+                )
+        except Exception as exc:
+            log.error(f"Failed to persist filled order {order.order_id}: {exc}")
 
     def _post_to_bridge(
         self, sizing: PositionSizing, side: str, price: float

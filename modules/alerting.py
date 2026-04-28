@@ -164,15 +164,23 @@ class AlertingEngine:
         msg += f"*Reasoning:* {signal.reasoning}"
         return msg
 
-    def notify_order_filled(self, order: Any) -> bool:
+    def notify_order_filled(
+        self,
+        order: Any,
+        account_balance: float,
+        risk_amount: float,
+        lot_size: float,
+    ) -> bool:
         """Alert on order execution."""
         msg = (
-            f"✅ *ORDER FILLED ({order.symbol})*\n"
-            f"ID: `{order.order_id}`\n"
-            f"Side: `{order.side.upper()}`\n"
-            f"Price: `{order.price:.4f}`\n"
-            f"Amount: `{order.amount:.6f}`\n"
-            f"Mode: `{'Paper' if order.is_paper else 'Live'}`"
+            f"✅ ORDER FILLED ({order.symbol})\n"
+            f"ID: {order.order_id}\n"
+            f"Side: {order.side.upper()}\n"
+            f"Price: {order.price:.4f}\n"
+            f"Lot Size: {lot_size:.2f} lots\n"
+            f"Account Balance: ${account_balance:,.2f}\n"
+            f"Risk Amount: ${risk_amount:,.2f}\n"
+            f"Mode: {'Paper' if order.is_paper else 'Live'}"
         )
         return self.send_message(msg)
 
