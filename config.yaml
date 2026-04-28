@@ -30,6 +30,7 @@ risk:
   max_open_trades: 3
   max_trades_per_day: 5        # New: anti-overtrading limit
   max_daily_loss: 0.05         # 5% daily loss limit → bot pauses
+  opposite_signal_confidence: 85.0  # min confidence required to reverse an open position
   min_rr_ratio: 1.5            # minimum risk/reward to take trade
   atr_multiplier: 1.5          # ATR × this = stop-loss distance
   tp1_multiplier: 1.5          # TP1 = 1.5× the risk amount

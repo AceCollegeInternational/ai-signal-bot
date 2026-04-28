@@ -253,10 +253,9 @@ class TradingBot:
         if htf_context:
             htf_context["slope"] = slope
 
-        # 5. Check for active position
+        # 5. Always manage active position first (but keep evaluating for reversals)
         if symbol in self.risk_manager.open_positions:
             await self.manage_open_position(symbol, df)
-            return
 
         # 5.5 Bar Close Logic (Prevents Scalping)
         last_ts = df.index[-1]
@@ -286,32 +285,11 @@ class TradingBot:
             )
             setattr(signal, "fundamental_context", fundamental_context)
 
-        # Track signal history
-        self.signal_history.append(
-            {
-                "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "symbol": symbol,
-                "signal": signal.signal,
-                "confidence": signal.confidence,
-                "risk_reward_ratio": signal.risk_reward_ratio,
-            }
-        )
-
-        # Sync all signals to Execution Server for MT5 Dashboard
-        try:
-            self._sync_signal_to_server(signal)
-        except Exception as e:
-            log.warning(f"Failed to sync signal to server: {e}")
-
         if signal.signal == "HOLD":
             return
 
         # Record signal time for cooldown
         self.last_signal_time[symbol] = datetime.now(timezone.utc)
-
-        # Notify on potentially actionable signal (high confidence)
-        if signal.confidence >= 50:
-            self.alerting_engine.notify_signal(signal)
 
         # 6. Risk Management Evaluation
         approved, sizing = self.risk_manager.evaluate_signal(signal, df, symbol)
@@ -324,11 +302,62 @@ class TradingBot:
 
         # 7. Execution
         current_price = self.data_engine.get_live_price(symbol)
+
+        if sizing.is_reversal:
+            existing_pos = self.risk_manager.open_positions.get(symbol)
+            if existing_pos is None:
+                log.warning(
+                    "Reversal approved for %s but no open position remains; skipping entry.",
+                    symbol,
+                )
+                return
+            close_reason = "Reversal signal approved"
+            close_order = self.execution_engine.close_position(
+                symbol=symbol,
+                amount=existing_pos.position_size,
+                current_price=current_price,
+                direction=existing_pos.direction,
+                reason=close_reason,
+            )
+            if close_order.status != "filled":
+                log.warning(
+                    "Reversal close failed for %s (%s); skipping new entry.",
+                    symbol,
+                    close_order.status,
+                )
+                return
+            pnl = self.risk_manager.close_position(
+                symbol, close_order.price, reason=close_reason
+            )
+            self.alerting_engine.notify_position_closed(
+                symbol, pnl, close_reason, close_order.price
+            )
+
         order = self.execution_engine.place_order(sizing, current_price)
 
         if order.status == "filled":
             self.risk_manager.open_position(sizing)
-            self.alerting_engine.notify_order_filled(order)
+            order_notice_sent = self.alerting_engine.notify_order_filled(order)
+            if not order_notice_sent:
+                log.warning(
+                    "Order filled for %s, but ORDER FILLED notification failed. Suppressing signal release.",
+                    symbol,
+                )
+                return
+            self.signal_history.append(
+                {
+                    "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                    "symbol": symbol,
+                    "signal": signal.signal,
+                    "confidence": signal.confidence,
+                    "risk_reward_ratio": signal.risk_reward_ratio,
+                }
+            )
+            try:
+                self._sync_signal_to_server(signal)
+            except Exception as e:
+                log.warning(f"Failed to sync signal to server: {e}")
+            self.alerting_engine.notify_signal(signal)
 
     def _get_symbol_data(self, symbol: str, timeframe: str, higher_timeframe: str) -> Any:
         """Return (df, df_htf) from EA push store when fresh; fallback to API if enabled."""
@@ -455,7 +484,9 @@ class TradingBot:
 
     async def manage_open_position(self, symbol: str, df: Any) -> None:
         """Monitor and exit open positions."""
-        pos = self.risk_manager.open_positions[symbol]
+        pos = self.risk_manager.open_positions.get(symbol)
+        if pos is None:
+            return
         curr_price = self.data_engine.get_live_price(symbol)
         if curr_price <= 0 and df is not None and not df.empty:
             curr_price = float(df["close"].iloc[-1])
@@ -488,16 +519,16 @@ class TradingBot:
 
         if exit_trigger:
             reason = f"{exit_trigger} hit"
-            order = self.execution_engine.close_position(
+            close_order = self.execution_engine.close_position(
                 symbol, pos.position_size, curr_price, pos.direction, reason=reason
             )
 
-            if order.status == "filled":
+            if close_order.status == "filled":
                 pnl = self.risk_manager.close_position(
-                    symbol, order.price, reason=reason
+                    symbol, close_order.price, reason=reason
                 )
                 self.alerting_engine.notify_position_closed(
-                    symbol, pnl, reason, order.price
+                    symbol, pnl, reason, close_order.price
                 )
 
     def _sync_signal_to_server(self, signal: Any) -> None:

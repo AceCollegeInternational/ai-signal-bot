@@ -99,10 +99,10 @@ class AlertingEngine:
             log.error(f"Failed to send Telegram alert: {exc}")
             return False
 
-    def notify_signal(self, signal: Any) -> None:
+    def notify_signal(self, signal: Any) -> bool:
         """Alert on new signal generation."""
         msg = self.format_signal_message(signal)
-        self.send_message(msg)
+        return self.send_message(msg)
 
     def format_signal_message(self, signal: Any) -> str:
         """Build Telegram-ready signal text."""
@@ -164,7 +164,7 @@ class AlertingEngine:
         msg += f"*Reasoning:* {signal.reasoning}"
         return msg
 
-    def notify_order_filled(self, order: Any) -> None:
+    def notify_order_filled(self, order: Any) -> bool:
         """Alert on order execution."""
         msg = (
             f"✅ *ORDER FILLED ({order.symbol})*\n"
@@ -174,7 +174,7 @@ class AlertingEngine:
             f"Amount: `{order.amount:.6f}`\n"
             f"Mode: `{'Paper' if order.is_paper else 'Live'}`"
         )
-        self.send_message(msg)
+        return self.send_message(msg)
 
     def notify_position_closed(
         self, symbol: str, pnl: float, reason: str, price: float
