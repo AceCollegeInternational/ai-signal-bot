@@ -735,6 +735,74 @@ class RiskManager:
             "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
         }
 
+    def get_week_summary(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        timezone_str: str = "America/New_York",
+    ) -> Dict[str, Any]:
+        """
+        Aggregate closed-trade stats for an arbitrary [start_dt, end_dt] period.
+        """
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=tz)
+        else:
+            start_dt = start_dt.astimezone(tz)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=tz)
+        else:
+            end_dt = end_dt.astimezone(tz)
+
+        week_label = f"{start_dt.date()} to {end_dt.date()}"
+        default_summary = {
+            "week_label": week_label,
+            "total_orders": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_profit": 0.0,
+            "total_risked": 0.0,
+            "cumulative_rr": 0.0,
+        }
+
+        if not os.path.exists(self.journal_path):
+            return default_summary
+
+        try:
+            df = pd.read_csv(self.journal_path)
+        except Exception as exc:
+            log.error(f"Failed reading trade journal for weekly summary: {exc}")
+            return default_summary
+
+        if df.empty or "Timestamp" not in df.columns:
+            return default_summary
+
+        timestamps = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        timestamps_local = timestamps.dt.tz_convert(tz)
+        period_df = df[
+            (timestamps_local >= start_dt) & (timestamps_local <= end_dt)
+        ].copy()
+        if period_df.empty:
+            return default_summary
+
+        pnl = pd.to_numeric(period_df.get("PnL"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(period_df.get("Risk_Amount"), errors="coerce").fillna(0.0)
+        total_profit = float(pnl.sum())
+        total_risked = float(risk.sum())
+        return {
+            "week_label": week_label,
+            "total_orders": int(len(period_df)),
+            "wins": int((pnl > 0).sum()),
+            "losses": int((pnl < 0).sum()),
+            "total_profit": total_profit,
+            "total_risked": total_risked,
+            "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+        }
+
     # ─── Daily P&L Management ─────────────────────────────────────────────────
 
     def _reset_daily_pnl_if_new_day(self) -> None:

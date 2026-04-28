@@ -29,6 +29,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -157,7 +158,7 @@ class TradingBot:
         self._runtime_state = self._load_runtime_state()
         self._market_closed_notified = False  # Runtime-only debounce
         self._market_closed_window_id = self._runtime_state.get("market_closed_window_id")
-        self._weekly_summary_sent_week = self._runtime_state.get("weekly_summary_sent_week")
+        self._weekly_summary_sent_close_window = self._runtime_state.get("weekly_summary_sent_close_window")
         self.running = False
 
     async def start(self) -> None:
@@ -173,7 +174,6 @@ class TradingBot:
                 # ── Market Hours Guard ─────────────────────────────
                 mh_cfg = self.config.get("market_hours", {})
                 tz_str = mh_cfg.get("timezone", "America/New_York")
-                self._maybe_send_weekly_summary(tz_str)
                 if mh_cfg.get("enforce_forex_close", True):
                     closed, msg = is_market_closed(tz_str)
                     if closed:
@@ -186,6 +186,10 @@ class TradingBot:
                             self.alerting_engine.send_message(
                                 f"🌙 *Market Closed*\n{msg}\n\nBot is paused until market reopens.",
                                 silent=True,
+                            )
+                            self._maybe_send_weekly_summary_at_friday_close(
+                                timezone_str=tz_str,
+                                close_window_id=close_window_id,
                             )
                             self._market_closed_notified = True
                             self._market_closed_window_id = close_window_id
@@ -636,18 +640,34 @@ class TradingBot:
         except Exception as exc:
             log.warning(f"Failed to save runtime state: {exc}")
 
-    def _maybe_send_weekly_summary(self, timezone_str: str) -> None:
+    def _maybe_send_weekly_summary_at_friday_close(
+        self, timezone_str: str, close_window_id: str
+    ) -> None:
         alerts_cfg = self.config.get("alerts", {})
         if not alerts_cfg.get("send_weekly_summary", True):
             return
         try:
-            week_key = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%G-W%V")
-            if self._weekly_summary_sent_week == week_key:
+            try:
+                tz = ZoneInfo(timezone_str)
+            except Exception:
+                tz = ZoneInfo("America/New_York")
+            now_local = datetime.now(tz)
+            is_friday_close = now_local.weekday() == 4 and now_local.hour >= 17
+            if not is_friday_close:
                 return
-            summary = self.risk_manager.get_previous_week_summary(timezone_str=timezone_str)
+            if self._weekly_summary_sent_close_window == close_window_id:
+                return
+            start_of_week = (now_local - timedelta(days=now_local.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            summary = self.risk_manager.get_week_summary(
+                start_dt=start_of_week,
+                end_dt=now_local,
+                timezone_str=timezone_str,
+            )
             self.alerting_engine.send_weekly_summary(summary)
-            self._weekly_summary_sent_week = week_key
-            self._runtime_state["weekly_summary_sent_week"] = week_key
+            self._weekly_summary_sent_close_window = close_window_id
+            self._runtime_state["weekly_summary_sent_close_window"] = close_window_id
             self._save_runtime_state()
         except Exception as exc:
             log.error(f"Failed to prepare/send weekly summary: {exc}")
