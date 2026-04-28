@@ -337,7 +337,14 @@ class TradingBot:
 
         if order.status == "filled":
             self.risk_manager.open_position(sizing)
-            order_notice_sent = self.alerting_engine.notify_order_filled(order)
+            # Forex convention: 1.00 lot = 100,000 base units.
+            lot_size = sizing.position_size / 100_000
+            order_notice_sent = self.alerting_engine.notify_order_filled(
+                order=order,
+                account_balance=self.risk_manager.account_balance,
+                risk_amount=sizing.risk_amount,
+                lot_size=lot_size,
+            )
             if not order_notice_sent:
                 log.warning(
                     "Order filled for %s, but ORDER FILLED notification failed. Suppressing signal release.",
