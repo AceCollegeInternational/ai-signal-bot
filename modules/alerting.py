@@ -215,6 +215,21 @@ class AlertingEngine:
         )
         self.send_message(msg)
 
+    def send_weekly_summary(self, summary: Dict[str, Any]) -> None:
+        """Send weekly closed-orders performance summary."""
+        profit = float(summary.get("total_profit", 0.0))
+        icon = "📈" if profit >= 0 else "📉"
+        msg = (
+            f"{icon} *WEEKLY SUMMARY* {icon}\n"
+            f"Period: `{summary.get('week_label', 'N/A')}`\n"
+            f"Total Orders: `{summary.get('total_orders', 0)}`\n"
+            f"Wins: `{summary.get('wins', 0)}` | Losses: `{summary.get('losses', 0)}`\n"
+            f"Total Profit: *{profit:+.2f} USDT*\n"
+            f"Total Risked: `{float(summary.get('total_risked', 0.0)):.2f} USDT`\n"
+            f"Cumulative R/R: `{float(summary.get('cumulative_rr', 0.0)):.2f}`"
+        )
+        self.send_message(msg, silent=True)
+
 
 class Dashboard:
     """
