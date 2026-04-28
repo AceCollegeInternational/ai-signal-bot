@@ -73,6 +73,8 @@ class PositionSizing:
     approved: bool = False
     rejection_reason: str = ""
     ml_snapshot: Dict[str, Any] = field(default_factory=dict)
+    is_reversal: bool = False
+    reversal_from: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,6 +138,9 @@ class RiskManager:
         self.tp1_multiplier: float = risk_cfg.get("tp1_multiplier", 1.5)
         self.tp2_multiplier: float = risk_cfg.get("tp2_multiplier", 3.0)
         self.max_trades_per_day: int = risk_cfg.get("max_trades_per_day", 5)
+        self.opposite_signal_confidence: float = risk_cfg.get(
+            "opposite_signal_confidence", 85.0
+        )
 
         # Journaling setup
         self.journal_path = os.path.join("logs", "trade_journal.csv")
@@ -213,6 +218,9 @@ class RiskManager:
         """
         sym = symbol or signal.symbol
         sizing = PositionSizing(symbol=sym)
+        signal_direction = "long" if signal.signal == "BUY" else "short"
+        open_pos = self.open_positions.get(sym)
+        is_symbol_reversal = False
 
         # Pre-calculate indicator snapshot for ML training (even if rejected, we might want to know why)
         indicators = {}
@@ -240,56 +248,70 @@ class RiskManager:
             log.info(f"Signal rejected (daily limit): {sym}")
             return False, sizing
 
-        # 3. Max open trades
-        if len(self.open_positions) >= self.max_open_trades:
+        # 3. Position-aware gate for same symbol (supports explicit reversal checks)
+        if open_pos is not None:
+            if signal_direction == open_pos.direction:
+                sizing.rejection_reason = (
+                    f"Same-direction signal rejected while {sym} position is open"
+                )
+                log.info(f"Signal rejected (same-direction follow-up): {sym}")
+                return False, sizing
+
+            if signal.confidence < self.opposite_signal_confidence:
+                sizing.rejection_reason = (
+                    "Opposite signal rejected: confidence "
+                    f"{signal.confidence:.1f} < {self.opposite_signal_confidence:.1f}"
+                )
+                log.info(f"Signal rejected (reversal confidence): {sym}")
+                return False, sizing
+
+            is_symbol_reversal = True
+
+        # 4. Max open trades (allow same-symbol reversal to continue through checks)
+        if len(self.open_positions) >= self.max_open_trades and not is_symbol_reversal:
             sizing.rejection_reason = (
                 f"Max open trades reached ({self.max_open_trades})"
             )
             log.info(f"Signal rejected (max trades): {sym}")
             return False, sizing
 
-        # 3. Already in a position for this symbol
-        if sym in self.open_positions:
-            sizing.rejection_reason = f"Already in an open position for {sym}"
-            return False, sizing
-
-        # 4. Correlation check (avoid multiple positions in highly correlated pairs)
-        if self._is_highly_correlated_open(sym):
+        # 5. Correlation check (avoid multiple positions in highly correlated pairs)
+        if not is_symbol_reversal and self._is_highly_correlated_open(sym):
             sizing.rejection_reason = (
                 f"Highly correlated pair already has an open position"
             )
             log.info(f"Signal rejected (correlation): {sym}")
             return False, sizing
 
-        # 4. Session Filter
+        # 6. Session Filter
         if self.session_filter_enabled and not self._is_in_trading_session():
             sizing.rejection_reason = "Outside of volatile trading sessions (London/NY)"
             log.info(f"Signal rejected (session filter): {sym}")
             return False, sizing
 
-        # 5. High-impact news event check
+        # 7. High-impact news event check
         if self.news_filter.is_trading_suspended():
             sizing.rejection_reason = "High-impact news event — trading suspended"
             log.info(f"Signal rejected (news event): {sym}")
             return False, sizing
 
-        # 6. ML Signature Check (The Gatekeeper)
+        # 8. ML Signature Check (The Gatekeeper)
         if not self.ml_validator.is_approved(sizing.ml_snapshot):
             sizing.rejection_reason = (
                 "ML Rejection: Setup history shows low win probability"
             )
             log.info(f"Signal rejected (ML validation): {sym}")
             return False, sizing
-        if not signal.is_actionable(self.min_rr_ratio):
+        if not signal.is_actionable(min_confidence=0.0, min_rr=self.min_rr_ratio):
             sizing.rejection_reason = (
                 f"Signal not actionable: confidence={signal.confidence:.1f} "
                 f"R/R={signal.risk_reward_ratio:.2f}"
             )
             return False, sizing
 
-        # 6. Compute ATR-based levels
+        # 9. Compute ATR-based levels
         atr = self._get_atr(df)
-        direction = "long" if signal.signal == "BUY" else "short"
+        direction = signal_direction
 
         # Use Claude-suggested entry, override stops with ATR-based levels
         entry = signal.entry_price if signal.entry_price > 0 else self._last_close(df)
@@ -311,7 +333,7 @@ class RiskManager:
             entry, stop, self.tp1_multiplier, self.tp2_multiplier, direction
         )
 
-        # 7. R/R ratio check
+        # 10. R/R ratio check
         rr = risk_reward_ratio(entry, stop, tp1)
         if rr < self.min_rr_ratio:
             sizing.rejection_reason = (
@@ -320,7 +342,7 @@ class RiskManager:
             log.info(f"Signal rejected (R/R={rr:.2f}): {sym}")
             return False, sizing
 
-        # 8. Position sizing
+        # 11. Position sizing
         pos_size = calc_position_size(
             self.account_balance,
             self.max_risk_per_trade,
@@ -345,6 +367,8 @@ class RiskManager:
             risk_reward=rr,
             atr=atr,
             approved=True,
+            is_reversal=is_symbol_reversal,
+            reversal_from=open_pos.direction if open_pos else "",
         )
         log.info(
             f"Signal APPROVED: {sym} {direction.upper()} @ {entry:.4f} "
