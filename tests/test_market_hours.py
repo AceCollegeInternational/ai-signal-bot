@@ -17,7 +17,7 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if root not in sys.path:
     sys.path.append(root)
 
-from utils.market_hours import is_market_closed
+from utils.market_hours import is_friday_close_dispatch_time, is_market_closed
 
 
 def _mock_now(year, month, day, hour, minute=0, tz_str="America/New_York"):
@@ -92,6 +92,24 @@ def test_tuesday_midday():
         assert not closed, f"Expected OPEN on Tuesday noon, got: {msg}"
 
 
+def test_friday_close_dispatch_window_open():
+    """Friday 5:04 PM EST -> dispatch window should be OPEN."""
+    fake_now = _mock_now(2026, 3, 13, 17, 4)
+    assert is_friday_close_dispatch_time(fake_now, grace_minutes=10)
+
+
+def test_friday_close_dispatch_window_closed_after_grace():
+    """Friday 5:15 PM EST -> dispatch window should be CLOSED."""
+    fake_now = _mock_now(2026, 3, 13, 17, 15)
+    assert not is_friday_close_dispatch_time(fake_now, grace_minutes=10)
+
+
+def test_friday_close_dispatch_window_closed_on_sunday():
+    """Sunday 12:00 PM EST -> dispatch window should be CLOSED."""
+    fake_now = _mock_now(2026, 3, 15, 12, 0)
+    assert not is_friday_close_dispatch_time(fake_now, grace_minutes=10)
+
+
 if __name__ == "__main__":
     print("\n=== Market Hours Guard Tests ===\n")
     tests = [
@@ -101,6 +119,9 @@ if __name__ == "__main__":
         test_sunday_before_open,
         test_sunday_after_open,
         test_tuesday_midday,
+        test_friday_close_dispatch_window_open,
+        test_friday_close_dispatch_window_closed_after_grace,
+        test_friday_close_dispatch_window_closed_on_sunday,
     ]
     passed = 0
     for t in tests:
