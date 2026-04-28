@@ -20,6 +20,7 @@ Usage:
 import argparse
 import asyncio
 from collections import deque
+import json
 import signal
 import os
 import sys
@@ -28,6 +29,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -44,7 +46,7 @@ from modules.pattern_detector import PatternDetector
 from modules.risk_manager import RiskManager
 from utils.helpers import load_config
 from utils.logger import get_logger, configure_from_config
-from utils.market_hours import is_market_closed
+from utils.market_hours import is_market_closed, get_market_close_window_id
 
 # Load environment variables from .env
 load_dotenv()
@@ -152,19 +154,17 @@ class TradingBot:
         self.signal_history: List[Dict[str, Any]] = []
         self.last_bar_time: Dict[str, datetime] = {}
         self.last_signal_time: Dict[str, datetime] = {}  # Per-symbol cooldown
-        self._market_closed_notified = False  # Avoid spamming "market closed"
+        self.state_path = os.path.join("logs", "bot_runtime_state.json")
+        self._runtime_state = self._load_runtime_state()
+        self._market_closed_notified = False  # Runtime-only debounce
+        self._market_closed_window_id = self._runtime_state.get("market_closed_window_id")
+        self._weekly_summary_sent_close_window = self._runtime_state.get("weekly_summary_sent_close_window")
         self.running = False
 
     async def start(self) -> None:
         """Start the main bot loop."""
         self.running = True
         log.info(f"Bot starting... Mode: {self.execution_engine.mode.upper()}")
-
-        # Send startup alert
-        self.alerting_engine.send_message(
-            f"🚀 *AI Trading Bot Started*\nMode: `{self.execution_engine.mode.upper()}`\nSymbols: `{self.config['trading']['symbols']}`",
-            silent=True,
-        )
 
         # Run Dashboard in parallel if not in backtest mode
         dashboard_task = asyncio.create_task(self.dashboard.run_live(self))
@@ -173,17 +173,28 @@ class TradingBot:
             while self.running:
                 # ── Market Hours Guard ─────────────────────────────
                 mh_cfg = self.config.get("market_hours", {})
+                tz_str = mh_cfg.get("timezone", "America/New_York")
                 if mh_cfg.get("enforce_forex_close", True):
-                    tz_str = mh_cfg.get("timezone", "America/New_York")
                     closed, msg = is_market_closed(tz_str)
                     if closed:
-                        if not self._market_closed_notified:
+                        close_window_id = get_market_close_window_id(tz_str)
+                        if (
+                            not self._market_closed_notified
+                            and close_window_id != self._market_closed_window_id
+                        ):
                             log.info(msg)
                             self.alerting_engine.send_message(
                                 f"🌙 *Market Closed*\n{msg}\n\nBot is paused until market reopens.",
                                 silent=True,
                             )
+                            self._maybe_send_weekly_summary_at_friday_close(
+                                timezone_str=tz_str,
+                                close_window_id=close_window_id,
+                            )
                             self._market_closed_notified = True
+                            self._market_closed_window_id = close_window_id
+                            self._runtime_state["market_closed_window_id"] = close_window_id
+                            self._save_runtime_state()
                         await asyncio.sleep(300)  # Check again in 5 minutes
                         continue
                     else:
@@ -193,7 +204,10 @@ class TradingBot:
                                 "☀️ *Market Open*\nForex market has reopened. Bot is resuming.",
                                 silent=True,
                             )
-                            self._market_closed_notified = False
+                        self._market_closed_notified = False
+                        self._market_closed_window_id = None
+                        self._runtime_state["market_closed_window_id"] = None
+                        self._save_runtime_state()
 
                 symbols_this_cycle = self._next_symbols_batch()
                 if not symbols_this_cycle:
@@ -606,6 +620,57 @@ class TradingBot:
         """Normalize bridge URL for loopback calls inside the same process."""
         base = self.bridge_url.rstrip("/")
         return base.replace("://0.0.0.0", "://127.0.0.1")
+
+    def _load_runtime_state(self) -> Dict[str, Any]:
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        if not os.path.exists(self.state_path):
+            return {}
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            log.warning(f"Failed to load runtime state: {exc}")
+            return {}
+
+    def _save_runtime_state(self) -> None:
+        try:
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump(self._runtime_state, f)
+        except Exception as exc:
+            log.warning(f"Failed to save runtime state: {exc}")
+
+    def _maybe_send_weekly_summary_at_friday_close(
+        self, timezone_str: str, close_window_id: str
+    ) -> None:
+        alerts_cfg = self.config.get("alerts", {})
+        if not alerts_cfg.get("send_weekly_summary", True):
+            return
+        try:
+            try:
+                tz = ZoneInfo(timezone_str)
+            except Exception:
+                tz = ZoneInfo("America/New_York")
+            now_local = datetime.now(tz)
+            is_friday_close = now_local.weekday() == 4 and now_local.hour >= 17
+            if not is_friday_close:
+                return
+            if self._weekly_summary_sent_close_window == close_window_id:
+                return
+            start_of_week = (now_local - timedelta(days=now_local.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            summary = self.risk_manager.get_week_summary(
+                start_dt=start_of_week,
+                end_dt=now_local,
+                timezone_str=timezone_str,
+            )
+            self.alerting_engine.send_weekly_summary(summary)
+            self._weekly_summary_sent_close_window = close_window_id
+            self._runtime_state["weekly_summary_sent_close_window"] = close_window_id
+            self._save_runtime_state()
+        except Exception as exc:
+            log.error(f"Failed to prepare/send weekly summary: {exc}")
 
     async def run_backtest(self) -> None:
         """Run backtesting mode for multiple timeframes and exit."""

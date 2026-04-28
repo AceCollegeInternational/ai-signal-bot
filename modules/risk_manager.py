@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -107,6 +108,8 @@ class OpenPosition:
     trailing_stop: Optional[float] = None
     tp1_hit: bool = False
     ml_snapshot: Dict[str, Any] = field(default_factory=dict)
+    initial_risk_amount: float = 0.0
+    planned_risk_reward: float = 0.0
 
     def unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L in quote currency."""
@@ -398,6 +401,8 @@ class RiskManager:
             take_profit_1=sizing.take_profit_1,
             take_profit_2=sizing.take_profit_2,
             ml_snapshot=sizing.ml_snapshot,
+            initial_risk_amount=sizing.risk_amount,
+            planned_risk_reward=sizing.risk_reward,
         )
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
@@ -591,6 +596,8 @@ class RiskManager:
                         "PnL_Pct",
                         "Reason",
                         "Duration_Mins",
+                        "Risk_Amount",
+                        "Planned_RR",
                     ]
                 )
 
@@ -611,7 +618,7 @@ class RiskManager:
                 writer = csv.writer(f)
                 writer.writerow(
                     [
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
                         pos.symbol,
                         pos.direction,
                         f"{pos.entry_price:.5f}",
@@ -621,6 +628,8 @@ class RiskManager:
                         f"{pnl_pct:.2f}%",
                         reason,
                         f"{duration:.1f}",
+                        f"{pos.initial_risk_amount:.2f}",
+                        f"{pos.planned_risk_reward:.2f}",
                     ]
                 )
 
@@ -640,6 +649,159 @@ class RiskManager:
             log.debug(f"Trade logged to journal and ML dataset: {pos.symbol}")
         except Exception as e:
             log.error(f"Failed to log trade to journal: {e}")
+
+    def get_previous_week_summary(
+        self, timezone_str: str = "America/New_York"
+    ) -> Dict[str, Any]:
+        """
+        Aggregate closed-trade stats for the previous calendar week (Mon-Sun).
+        """
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+
+        now = datetime.now(tz)
+        start_of_this_week = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        start_prev_week = start_of_this_week - timedelta(days=7)
+        end_prev_week = start_of_this_week
+        week_label = f"{start_prev_week.date()} to {(end_prev_week - timedelta(seconds=1)).date()}"
+
+        if not os.path.exists(self.journal_path):
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        try:
+            df = pd.read_csv(self.journal_path)
+        except Exception as exc:
+            log.error(f"Failed reading trade journal for weekly summary: {exc}")
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        if df.empty or "Timestamp" not in df.columns:
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        timestamps = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        timestamps_local = timestamps.dt.tz_convert(tz)
+        week_df = df[(timestamps_local >= start_prev_week) & (timestamps_local < end_prev_week)].copy()
+
+        if week_df.empty:
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        pnl = pd.to_numeric(week_df.get("PnL"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(week_df.get("Risk_Amount"), errors="coerce").fillna(0.0)
+        total_profit = float(pnl.sum())
+        total_risked = float(risk.sum())
+
+        return {
+            "week_label": week_label,
+            "total_orders": int(len(week_df)),
+            "wins": int((pnl > 0).sum()),
+            "losses": int((pnl < 0).sum()),
+            "total_profit": total_profit,
+            "total_risked": total_risked,
+            "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+        }
+
+    def get_week_summary(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        timezone_str: str = "America/New_York",
+    ) -> Dict[str, Any]:
+        """
+        Aggregate closed-trade stats for an arbitrary [start_dt, end_dt] period.
+        """
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=tz)
+        else:
+            start_dt = start_dt.astimezone(tz)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=tz)
+        else:
+            end_dt = end_dt.astimezone(tz)
+
+        week_label = f"{start_dt.date()} to {end_dt.date()}"
+        default_summary = {
+            "week_label": week_label,
+            "total_orders": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_profit": 0.0,
+            "total_risked": 0.0,
+            "cumulative_rr": 0.0,
+        }
+
+        if not os.path.exists(self.journal_path):
+            return default_summary
+
+        try:
+            df = pd.read_csv(self.journal_path)
+        except Exception as exc:
+            log.error(f"Failed reading trade journal for weekly summary: {exc}")
+            return default_summary
+
+        if df.empty or "Timestamp" not in df.columns:
+            return default_summary
+
+        timestamps = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        timestamps_local = timestamps.dt.tz_convert(tz)
+        period_df = df[
+            (timestamps_local >= start_dt) & (timestamps_local <= end_dt)
+        ].copy()
+        if period_df.empty:
+            return default_summary
+
+        pnl = pd.to_numeric(period_df.get("PnL"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(period_df.get("Risk_Amount"), errors="coerce").fillna(0.0)
+        total_profit = float(pnl.sum())
+        total_risked = float(risk.sum())
+        return {
+            "week_label": week_label,
+            "total_orders": int(len(period_df)),
+            "wins": int((pnl > 0).sum()),
+            "losses": int((pnl < 0).sum()),
+            "total_profit": total_profit,
+            "total_risked": total_risked,
+            "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+        }
 
     # ─── Daily P&L Management ─────────────────────────────────────────────────
 
