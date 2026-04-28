@@ -106,6 +106,7 @@ alerts:
   bot_token: "${TELEGRAM_BOT_TOKEN}"
   chat_id: "${TELEGRAM_CHAT_ID}"
   send_daily_summary: true
+  send_weekly_summary: true
   daily_summary_hour: 23       # 23:00 local time
 
 data:
