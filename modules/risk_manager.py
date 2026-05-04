@@ -23,6 +23,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -107,6 +108,9 @@ class OpenPosition:
     trailing_stop: Optional[float] = None
     tp1_hit: bool = False
     ml_snapshot: Dict[str, Any] = field(default_factory=dict)
+    initial_risk_amount: float = 0.0
+    planned_risk_reward: float = 0.0
+    trade_id: str = ""
 
     def unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L in quote currency."""
@@ -145,7 +149,9 @@ class RiskManager:
         # Journaling setup
         self.journal_path = os.path.join("logs", "trade_journal.csv")
         self.ml_dataset_path = os.path.join("logs", "ml_dataset.jsonl")
+        self.trade_lifecycle_path = os.path.join("logs", "trade_lifecycle.txt")
         self._init_journal()
+        self._init_trade_lifecycle_log()
 
         news_cfg = config.get("news", {})
         self.skip_high_impact_news: bool = news_cfg.get("skip_high_impact", True)
@@ -398,9 +404,13 @@ class RiskManager:
             take_profit_1=sizing.take_profit_1,
             take_profit_2=sizing.take_profit_2,
             ml_snapshot=sizing.ml_snapshot,
+            initial_risk_amount=sizing.risk_amount,
+            planned_risk_reward=sizing.risk_reward,
+            trade_id=f"{sizing.symbol}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
         )
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
+        self._log_trade_open(pos)
         log.info(
             f"Position opened: {sizing.symbol} {sizing.direction} @ {sizing.entry_price:.4f} (Trade #{self.trades_today} today)"
         )
@@ -436,6 +446,7 @@ class RiskManager:
 
         # Record to trade journal
         self._log_trade(pos, close_price, pnl, reason)
+        self._log_trade_close(pos, close_price, pnl, reason)
 
         # Check daily loss limit
         daily_loss_pct = -self.daily_pnl / self.initial_balance
@@ -591,8 +602,61 @@ class RiskManager:
                         "PnL_Pct",
                         "Reason",
                         "Duration_Mins",
+                        "Risk_Amount",
+                        "Planned_RR",
                     ]
                 )
+
+    def _init_trade_lifecycle_log(self) -> None:
+        """Initialize lifecycle log for open/close events."""
+        os.makedirs(os.path.dirname(self.trade_lifecycle_path), exist_ok=True)
+        if not os.path.exists(self.trade_lifecycle_path):
+            with open(self.trade_lifecycle_path, mode="w", encoding="utf-8") as f:
+                f.write("# trade lifecycle log (json lines)\n")
+
+    def _append_lifecycle_event(self, payload: Dict[str, Any]) -> None:
+        try:
+            with open(self.trade_lifecycle_path, mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception as exc:
+            log.error(f"Failed writing trade lifecycle event: {exc}")
+
+    def _log_trade_open(self, pos: OpenPosition) -> None:
+        self._append_lifecycle_event(
+            {
+                "event": "OPEN",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "trade_id": pos.trade_id,
+                "symbol": pos.symbol,
+                "direction": pos.direction,
+                "entry_price": float(pos.entry_price),
+                "size": float(pos.position_size),
+                "stop_loss": float(pos.stop_loss),
+                "take_profit_1": float(pos.take_profit_1),
+                "take_profit_2": float(pos.take_profit_2),
+                "risk_amount": float(pos.initial_risk_amount),
+                "planned_rr": float(pos.planned_risk_reward),
+            }
+        )
+
+    def _log_trade_close(
+        self, pos: OpenPosition, close_price: float, pnl: float, reason: str
+    ) -> None:
+        self._append_lifecycle_event(
+            {
+                "event": "CLOSE",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "trade_id": pos.trade_id,
+                "symbol": pos.symbol,
+                "direction": pos.direction,
+                "entry_price": float(pos.entry_price),
+                "close_price": float(close_price),
+                "pnl": float(pnl),
+                "result": "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN"),
+                "reason": reason,
+                "risk_amount": float(pos.initial_risk_amount),
+            }
+        )
 
     def _log_trade(
         self, pos: OpenPosition, close_price: float, pnl: float, reason: str
@@ -611,7 +675,7 @@ class RiskManager:
                 writer = csv.writer(f)
                 writer.writerow(
                     [
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
                         pos.symbol,
                         pos.direction,
                         f"{pos.entry_price:.5f}",
@@ -621,6 +685,8 @@ class RiskManager:
                         f"{pnl_pct:.2f}%",
                         reason,
                         f"{duration:.1f}",
+                        f"{pos.initial_risk_amount:.2f}",
+                        f"{pos.planned_risk_reward:.2f}",
                     ]
                 )
 
@@ -640,6 +706,173 @@ class RiskManager:
             log.debug(f"Trade logged to journal and ML dataset: {pos.symbol}")
         except Exception as e:
             log.error(f"Failed to log trade to journal: {e}")
+
+    def get_previous_week_summary(
+        self, timezone_str: str = "America/New_York"
+    ) -> Dict[str, Any]:
+        """
+        Aggregate closed-trade stats for the previous calendar week (Mon-Sun).
+        """
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+
+        now = datetime.now(tz)
+        start_of_this_week = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        start_prev_week = start_of_this_week - timedelta(days=7)
+        end_prev_week = start_of_this_week
+        week_label = f"{start_prev_week.date()} to {(end_prev_week - timedelta(seconds=1)).date()}"
+
+        if not os.path.exists(self.journal_path):
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        try:
+            df = pd.read_csv(self.journal_path)
+        except Exception as exc:
+            log.error(f"Failed reading trade journal for weekly summary: {exc}")
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        if df.empty or "Timestamp" not in df.columns:
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        timestamps = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        timestamps_local = timestamps.dt.tz_convert(tz)
+        week_df = df[(timestamps_local >= start_prev_week) & (timestamps_local < end_prev_week)].copy()
+
+        if week_df.empty:
+            return {
+                "week_label": week_label,
+                "total_orders": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_profit": 0.0,
+                "total_risked": 0.0,
+                "cumulative_rr": 0.0,
+            }
+
+        pnl = pd.to_numeric(week_df.get("PnL"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(week_df.get("Risk_Amount"), errors="coerce").fillna(0.0)
+        total_profit = float(pnl.sum())
+        total_risked = float(risk.sum())
+
+        return {
+            "week_label": week_label,
+            "total_orders": int(len(week_df)),
+            "wins": int((pnl > 0).sum()),
+            "losses": int((pnl < 0).sum()),
+            "total_profit": total_profit,
+            "total_risked": total_risked,
+            "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+        }
+
+    def get_week_summary(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        timezone_str: str = "America/New_York",
+    ) -> Dict[str, Any]:
+        """
+        Aggregate closed-trade stats for an arbitrary [start_dt, end_dt] period.
+        """
+        try:
+            tz = ZoneInfo(timezone_str)
+        except Exception:
+            tz = ZoneInfo("America/New_York")
+
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=tz)
+        else:
+            start_dt = start_dt.astimezone(tz)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=tz)
+        else:
+            end_dt = end_dt.astimezone(tz)
+
+        week_label = f"{start_dt.date()} to {end_dt.date()}"
+        default_summary = {
+            "week_label": week_label,
+            "total_orders": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_profit": 0.0,
+            "total_risked": 0.0,
+            "cumulative_rr": 0.0,
+        }
+
+        if not os.path.exists(self.trade_lifecycle_path):
+            return default_summary
+
+        try:
+            events: List[Dict[str, Any]] = []
+            with open(self.trade_lifecycle_path, mode="r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#"):
+                        continue
+                    try:
+                        evt = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("event") == "CLOSE":
+                        events.append(evt)
+        except Exception as exc:
+            log.error(f"Failed reading lifecycle log for weekly summary: {exc}")
+            return default_summary
+
+        if not events:
+            return default_summary
+
+        df = pd.DataFrame(events)
+        if "timestamp_utc" not in df.columns:
+            return default_summary
+        timestamps = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+        timestamps_local = timestamps.dt.tz_convert(tz)
+        period_df = df[
+            (timestamps_local >= start_dt) & (timestamps_local <= end_dt)
+        ].copy()
+        if period_df.empty:
+            return default_summary
+
+        pnl = pd.to_numeric(period_df.get("pnl"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(period_df.get("risk_amount"), errors="coerce").fillna(0.0)
+        total_profit = float(pnl.sum())
+        total_risked = float(risk.sum())
+        return {
+            "week_label": week_label,
+            "total_orders": int(len(period_df)),
+            "wins": int((pnl > 0).sum()),
+            "losses": int((pnl < 0).sum()),
+            "total_profit": total_profit,
+            "total_risked": total_risked,
+            "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+        }
 
     # ─── Daily P&L Management ─────────────────────────────────────────────────
 

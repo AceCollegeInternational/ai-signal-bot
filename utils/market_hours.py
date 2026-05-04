@@ -8,7 +8,7 @@ and reopens Sunday at 5:00 PM EST. This module determines whether
 the market is currently in this closed window.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Tuple
 from zoneinfo import ZoneInfo
 
@@ -80,3 +80,22 @@ def is_market_closed(timezone_str: str = "America/New_York") -> Tuple[bool, str]
         f"Current time: {now.strftime('%A %I:%M %p %Z')}"
     )
     return False, msg
+
+
+def get_market_close_window_id(timezone_str: str = "America/New_York") -> str:
+    """
+    Return a stable identifier for the active/nearest weekend close window.
+    """
+    try:
+        tz = ZoneInfo(timezone_str)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    now = datetime.now(tz)
+    weekday = now.weekday()  # Monday=0 ... Sunday=6
+
+    # Anchor each window to the Friday date that starts the closure.
+    days_since_friday = (weekday - 4) % 7
+    anchor = (now - timedelta(days=days_since_friday)).date()
+
+    return anchor.strftime("%Y-%m-%d")
