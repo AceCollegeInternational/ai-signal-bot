@@ -110,6 +110,7 @@ class OpenPosition:
     ml_snapshot: Dict[str, Any] = field(default_factory=dict)
     initial_risk_amount: float = 0.0
     planned_risk_reward: float = 0.0
+    trade_id: str = ""
 
     def unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L in quote currency."""
@@ -148,7 +149,9 @@ class RiskManager:
         # Journaling setup
         self.journal_path = os.path.join("logs", "trade_journal.csv")
         self.ml_dataset_path = os.path.join("logs", "ml_dataset.jsonl")
+        self.trade_lifecycle_path = os.path.join("logs", "trade_lifecycle.txt")
         self._init_journal()
+        self._init_trade_lifecycle_log()
 
         news_cfg = config.get("news", {})
         self.skip_high_impact_news: bool = news_cfg.get("skip_high_impact", True)
@@ -403,9 +406,11 @@ class RiskManager:
             ml_snapshot=sizing.ml_snapshot,
             initial_risk_amount=sizing.risk_amount,
             planned_risk_reward=sizing.risk_reward,
+            trade_id=f"{sizing.symbol}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
         )
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
+        self._log_trade_open(pos)
         log.info(
             f"Position opened: {sizing.symbol} {sizing.direction} @ {sizing.entry_price:.4f} (Trade #{self.trades_today} today)"
         )
@@ -441,6 +446,7 @@ class RiskManager:
 
         # Record to trade journal
         self._log_trade(pos, close_price, pnl, reason)
+        self._log_trade_close(pos, close_price, pnl, reason)
 
         # Check daily loss limit
         daily_loss_pct = -self.daily_pnl / self.initial_balance
@@ -600,6 +606,57 @@ class RiskManager:
                         "Planned_RR",
                     ]
                 )
+
+    def _init_trade_lifecycle_log(self) -> None:
+        """Initialize lifecycle log for open/close events."""
+        os.makedirs(os.path.dirname(self.trade_lifecycle_path), exist_ok=True)
+        if not os.path.exists(self.trade_lifecycle_path):
+            with open(self.trade_lifecycle_path, mode="w", encoding="utf-8") as f:
+                f.write("# trade lifecycle log (json lines)\n")
+
+    def _append_lifecycle_event(self, payload: Dict[str, Any]) -> None:
+        try:
+            with open(self.trade_lifecycle_path, mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(payload) + "\n")
+        except Exception as exc:
+            log.error(f"Failed writing trade lifecycle event: {exc}")
+
+    def _log_trade_open(self, pos: OpenPosition) -> None:
+        self._append_lifecycle_event(
+            {
+                "event": "OPEN",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "trade_id": pos.trade_id,
+                "symbol": pos.symbol,
+                "direction": pos.direction,
+                "entry_price": float(pos.entry_price),
+                "size": float(pos.position_size),
+                "stop_loss": float(pos.stop_loss),
+                "take_profit_1": float(pos.take_profit_1),
+                "take_profit_2": float(pos.take_profit_2),
+                "risk_amount": float(pos.initial_risk_amount),
+                "planned_rr": float(pos.planned_risk_reward),
+            }
+        )
+
+    def _log_trade_close(
+        self, pos: OpenPosition, close_price: float, pnl: float, reason: str
+    ) -> None:
+        self._append_lifecycle_event(
+            {
+                "event": "CLOSE",
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "trade_id": pos.trade_id,
+                "symbol": pos.symbol,
+                "direction": pos.direction,
+                "entry_price": float(pos.entry_price),
+                "close_price": float(close_price),
+                "pnl": float(pnl),
+                "result": "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN"),
+                "reason": reason,
+                "risk_amount": float(pos.initial_risk_amount),
+            }
+        )
 
     def _log_trade(
         self, pos: OpenPosition, close_price: float, pnl: float, reason: str
@@ -769,19 +826,33 @@ class RiskManager:
             "cumulative_rr": 0.0,
         }
 
-        if not os.path.exists(self.journal_path):
+        if not os.path.exists(self.trade_lifecycle_path):
             return default_summary
 
         try:
-            df = pd.read_csv(self.journal_path)
+            events: List[Dict[str, Any]] = []
+            with open(self.trade_lifecycle_path, mode="r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#"):
+                        continue
+                    try:
+                        evt = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("event") == "CLOSE":
+                        events.append(evt)
         except Exception as exc:
-            log.error(f"Failed reading trade journal for weekly summary: {exc}")
+            log.error(f"Failed reading lifecycle log for weekly summary: {exc}")
             return default_summary
 
-        if df.empty or "Timestamp" not in df.columns:
+        if not events:
             return default_summary
 
-        timestamps = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+        df = pd.DataFrame(events)
+        if "timestamp_utc" not in df.columns:
+            return default_summary
+        timestamps = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
         timestamps_local = timestamps.dt.tz_convert(tz)
         period_df = df[
             (timestamps_local >= start_dt) & (timestamps_local <= end_dt)
@@ -789,8 +860,8 @@ class RiskManager:
         if period_df.empty:
             return default_summary
 
-        pnl = pd.to_numeric(period_df.get("PnL"), errors="coerce").fillna(0.0)
-        risk = pd.to_numeric(period_df.get("Risk_Amount"), errors="coerce").fillna(0.0)
+        pnl = pd.to_numeric(period_df.get("pnl"), errors="coerce").fillna(0.0)
+        risk = pd.to_numeric(period_df.get("risk_amount"), errors="coerce").fillna(0.0)
         total_profit = float(pnl.sum())
         total_risked = float(risk.sum())
         return {

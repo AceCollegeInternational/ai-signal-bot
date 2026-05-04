@@ -99,21 +99,3 @@ def get_market_close_window_id(timezone_str: str = "America/New_York") -> str:
     anchor = (now - timedelta(days=days_since_friday)).date()
 
     return anchor.strftime("%Y-%m-%d")
-
-
-def is_friday_close_dispatch_time(now: datetime, grace_minutes: int = 10) -> bool:
-    """
-    Return True only during the Friday close dispatch window.
-
-    This is used for notifications that must fire strictly at (or very near)
-    Friday 5:00 PM in local market time, while still allowing small scheduler
-    delays.
-    """
-    if grace_minutes <= 0:
-        grace_minutes = 1
-
-    return (
-        now.weekday() == MARKET_CLOSE_DAY
-        and now.hour == MARKET_CLOSE_HOUR
-        and 0 <= now.minute < grace_minutes
-    )

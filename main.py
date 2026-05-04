@@ -46,11 +46,7 @@ from modules.pattern_detector import PatternDetector
 from modules.risk_manager import RiskManager
 from utils.helpers import load_config
 from utils.logger import get_logger, configure_from_config
-from utils.market_hours import (
-    get_market_close_window_id,
-    is_friday_close_dispatch_time,
-    is_market_closed,
-)
+from utils.market_hours import is_market_closed, get_market_close_window_id
 
 # Load environment variables from .env
 load_dotenv()
@@ -182,6 +178,8 @@ class TradingBot:
                     closed, msg = is_market_closed(tz_str)
                     if closed:
                         close_window_id = get_market_close_window_id(tz_str)
+                        if close_window_id == self._market_closed_window_id:
+                            self._market_closed_notified = True
                         if (
                             not self._market_closed_notified
                             and close_window_id != self._market_closed_window_id
@@ -656,7 +654,7 @@ class TradingBot:
             except Exception:
                 tz = ZoneInfo("America/New_York")
             now_local = datetime.now(tz)
-            is_friday_close = is_friday_close_dispatch_time(now_local, grace_minutes=10)
+            is_friday_close = now_local.weekday() == 4 and now_local.hour >= 17
             if not is_friday_close:
                 return
             if self._weekly_summary_sent_close_window == close_window_id:
