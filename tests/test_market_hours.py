@@ -104,6 +104,12 @@ def test_friday_close_dispatch_window_closed_after_grace():
     assert not is_friday_close_dispatch_time(fake_now, grace_minutes=10)
 
 
+def test_friday_close_dispatch_window_closed_on_saturday():
+    """Saturday 12:00 PM EST -> dispatch window should be CLOSED."""
+    fake_now = _mock_now(2026, 3, 14, 12, 0)
+    assert not is_friday_close_dispatch_time(fake_now, grace_minutes=10)
+
+
 def test_friday_close_dispatch_window_closed_on_sunday():
     """Sunday 12:00 PM EST -> dispatch window should be CLOSED."""
     fake_now = _mock_now(2026, 3, 15, 12, 0)
@@ -121,6 +127,7 @@ if __name__ == "__main__":
         test_tuesday_midday,
         test_friday_close_dispatch_window_open,
         test_friday_close_dispatch_window_closed_after_grace,
+        test_friday_close_dispatch_window_closed_on_saturday,
         test_friday_close_dispatch_window_closed_on_sunday,
     ]
     passed = 0
