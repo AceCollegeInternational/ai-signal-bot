@@ -46,7 +46,11 @@ from modules.pattern_detector import PatternDetector
 from modules.risk_manager import RiskManager
 from utils.helpers import load_config
 from utils.logger import get_logger, configure_from_config
-from utils.market_hours import is_market_closed, get_market_close_window_id
+from utils.market_hours import (
+    get_market_close_window_id,
+    is_friday_close_dispatch_time,
+    is_market_closed,
+)
 
 # Load environment variables from .env
 load_dotenv()
@@ -178,12 +182,16 @@ class TradingBot:
                     closed, msg = is_market_closed(tz_str)
                     if closed:
                         close_window_id = get_market_close_window_id(tz_str)
-                        if close_window_id == self._market_closed_window_id:
+                        already_handled = close_window_id == self._market_closed_window_id
+                        if already_handled:
                             self._market_closed_notified = True
-                        if (
+
+                        should_dispatch_close_notice = (
                             not self._market_closed_notified
-                            and close_window_id != self._market_closed_window_id
-                        ):
+                            and not already_handled
+                            and is_friday_close_dispatch_time(timezone_str=tz_str)
+                        )
+                        if should_dispatch_close_notice:
                             log.info(msg)
                             self.alerting_engine.send_message(
                                 f"🌙 *Market Closed*\n{msg}\n\nBot is paused until market reopens.",
@@ -197,6 +205,12 @@ class TradingBot:
                             self._market_closed_window_id = close_window_id
                             self._runtime_state["market_closed_window_id"] = close_window_id
                             self._save_runtime_state()
+                        elif not already_handled:
+                            log.debug(
+                                "Market is closed outside the Friday close dispatch window; "
+                                "suppressing Telegram close notice for %s.",
+                                close_window_id,
+                            )
                         await asyncio.sleep(300)  # Check again in 5 minutes
                         continue
                     else:
