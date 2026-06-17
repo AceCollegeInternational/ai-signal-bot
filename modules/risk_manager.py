@@ -150,6 +150,7 @@ class RiskManager:
         self.journal_path = os.path.join("logs", "trade_journal.csv")
         self.ml_dataset_path = os.path.join("logs", "ml_dataset.jsonl")
         self.trade_lifecycle_path = os.path.join("logs", "trade_lifecycle.txt")
+        self.open_positions_path = os.path.join("logs", "open_positions.json")
         self._init_journal()
         self._init_trade_lifecycle_log()
 
@@ -181,7 +182,7 @@ class RiskManager:
         # Live state tracking
         self.account_balance: float = account_balance
         self.initial_balance: float = account_balance
-        self.open_positions: Dict[str, OpenPosition] = {}  # symbol → position
+        self.open_positions: Dict[str, OpenPosition] = self._load_open_positions()
         self.daily_pnl: float = 0.0
         self.trades_today: int = 0
         self.daily_pnl_date: date = date.today()
@@ -411,6 +412,7 @@ class RiskManager:
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
         self._log_trade_open(pos)
+        self._save_open_positions()
         log.info(
             f"Position opened: {sizing.symbol} {sizing.direction} @ {sizing.entry_price:.4f} (Trade #{self.trades_today} today)"
         )
@@ -447,6 +449,7 @@ class RiskManager:
         # Record to trade journal
         self._log_trade(pos, close_price, pnl, reason)
         self._log_trade_close(pos, close_price, pnl, reason)
+        self._save_open_positions()
 
         # Check daily loss limit
         daily_loss_pct = -self.daily_pnl / self.initial_balance
@@ -620,6 +623,68 @@ class RiskManager:
                 f.write(json.dumps(payload) + "\n")
         except Exception as exc:
             log.error(f"Failed writing trade lifecycle event: {exc}")
+
+    def _save_open_positions(self) -> None:
+        """Persist open_positions to disk so they survive restarts."""
+        try:
+            os.makedirs(os.path.dirname(self.open_positions_path), exist_ok=True)
+            serialized = {}
+            for sym, pos in self.open_positions.items():
+                serialized[sym] = {
+                    "symbol": pos.symbol,
+                    "direction": pos.direction,
+                    "entry_price": pos.entry_price,
+                    "position_size": pos.position_size,
+                    "stop_loss": pos.stop_loss,
+                    "take_profit_1": pos.take_profit_1,
+                    "take_profit_2": pos.take_profit_2,
+                    "opened_at": pos.opened_at.isoformat(),
+                    "trailing_stop": pos.trailing_stop,
+                    "tp1_hit": pos.tp1_hit,
+                    "ml_snapshot": pos.ml_snapshot,
+                    "initial_risk_amount": pos.initial_risk_amount,
+                    "planned_risk_reward": pos.planned_risk_reward,
+                    "trade_id": pos.trade_id,
+                }
+            with open(self.open_positions_path, "w", encoding="utf-8") as f:
+                json.dump(serialized, f)
+        except Exception as exc:
+            log.error(f"Failed saving open positions: {exc}")
+
+    def _load_open_positions(self) -> Dict[str, "OpenPosition"]:
+        """Reload persisted open positions on startup."""
+        if not os.path.exists(self.open_positions_path):
+            return {}
+        try:
+            with open(self.open_positions_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            positions: Dict[str, OpenPosition] = {}
+            for sym, d in raw.items():
+                opened_at = datetime.fromisoformat(d["opened_at"])
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                positions[sym] = OpenPosition(
+                    symbol=d["symbol"],
+                    direction=d["direction"],
+                    entry_price=float(d["entry_price"]),
+                    position_size=float(d["position_size"]),
+                    stop_loss=float(d["stop_loss"]),
+                    take_profit_1=float(d["take_profit_1"]),
+                    take_profit_2=float(d["take_profit_2"]),
+                    opened_at=opened_at,
+                    trailing_stop=d.get("trailing_stop"),
+                    tp1_hit=bool(d.get("tp1_hit", False)),
+                    ml_snapshot=d.get("ml_snapshot", {}),
+                    initial_risk_amount=float(d.get("initial_risk_amount", 0.0)),
+                    planned_risk_reward=float(d.get("planned_risk_reward", 0.0)),
+                    trade_id=d.get("trade_id", ""),
+                )
+            if positions:
+                log.info(f"Restored {len(positions)} open position(s) from disk: {list(positions.keys())}")
+            return positions
+        except Exception as exc:
+            log.error(f"Failed loading open positions: {exc}")
+            return {}
 
     def _log_trade_open(self, pos: OpenPosition) -> None:
         self._append_lifecycle_event(
