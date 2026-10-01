@@ -271,6 +271,8 @@ def _insert_trade_cur(cur, t: Dict[str, Any], ignore: bool = False) -> Optional[
     cols = ", ".join(TRADE_INSERT_COLUMNS)
     marks = ", ".join(["%s"] * len(TRADE_INSERT_COLUMNS))
     verb = "INSERT IGNORE" if ignore else "INSERT"
+    if t.get("opened_at") is None:  # explicit NULL would bypass the column default
+        t = {**t, "opened_at": datetime.now(timezone.utc).replace(tzinfo=None)}
     cur.execute(f"{verb} INTO trades ({cols}) VALUES ({marks})", [t.get(c) for c in TRADE_INSERT_COLUMNS])
     if cur.rowcount == 0:
         return None
