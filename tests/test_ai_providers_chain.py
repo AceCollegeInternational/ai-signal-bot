@@ -14,8 +14,10 @@ GOOD = json.dumps({"signal": "BUY", "confidence": 80, "entry_price": 1.1, "stop_
 def make_fake(name, calls, fail=False):
     """Build a stand-in provider class that records calls and optionally raises."""
     class Fake(ase.AIProvider):
+        NAME = name
+
         def __init__(self, api_key, model, max_tokens, temperature):
-            self.model, self.temperature = model, temperature
+            self.model, self.model_name, self.temperature = model, model, temperature
 
         def generate_content(self, system_prompt, user_prompt):
             calls.append(name)
@@ -267,3 +269,25 @@ def test_all_providers_default_to_2000_max_tokens(env):
     env.setenv("DEEPSEEK_API_KEY", "k")
     engine = ase.AISignalEngine({"ai": {"primary_provider": "deepseek"}})
     assert engine.providers["deepseek"].max_tokens == 2000
+
+
+def test_signal_is_stamped_with_provider_and_model(env):
+    env.setenv("GROQ_MODEL", "llama-test")
+    env.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+    engine, _ = build(env, "deepseek", failing=("deepseek",))
+    sig = engine.get_signal({}, "EURUSD", "1h")
+    assert (sig.llm_provider, sig.llm_model) == ("groq", "llama-test")  # the provider that actually answered
+    engine, _ = build(env, "deepseek")
+    sig = engine.get_signal({}, "EURUSD", "1h")
+    assert (sig.llm_provider, sig.llm_model) == ("deepseek", "deepseek-reasoner")
+
+
+def test_real_providers_report_name_and_model(env):
+    pytest.importorskip("openai")
+    env.setenv("DEEPSEEK_API_KEY", "k")
+    env.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+    p = ase.AISignalEngine({"ai": {"primary_provider": "deepseek"}}).providers["deepseek"]
+    sig = ase.TradeSignal()
+    p.annotate(sig)
+    assert (sig.llm_provider, sig.llm_model) == ("deepseek", "deepseek-chat")
+    assert (ase.GeminiProvider.NAME, ase.GroqProvider.NAME, ase.AnthropicProvider.NAME) == ("gemini", "groq", "claude")

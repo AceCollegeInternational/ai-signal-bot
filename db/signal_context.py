@@ -28,6 +28,8 @@ def build_signal_dict(signal: Any, df: Any, htf_context: Optional[Dict[str, Any]
         "risk_reward_ratio": signal.risk_reward_ratio,
         "reasoning": signal.reasoning,
         "raw_response": getattr(signal, "raw_response", None),
+        "llm_provider": getattr(signal, "llm_provider", None),
+        "llm_model": getattr(signal, "llm_model", None),
     }
     if htf_context and htf_context.get("trend"):
         d["macro_trend"] = str(htf_context["trend"]).upper()

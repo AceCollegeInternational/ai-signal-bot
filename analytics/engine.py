@@ -177,6 +177,33 @@ def compute_factor_effectiveness() -> list:
     return results
 
 
+# ─── Provider performance ─────────────────────────────────────────────────────
+
+def compute_provider_performance() -> dict:
+    """Per LLM provider: signal count, avg confidence, and win rate over closed trades."""
+    with get_db() as cur:
+        cur.execute(
+            "SELECT llm_provider AS p, COUNT(*) AS n, AVG(confluence_score) AS conf FROM signals "
+            "WHERE llm_provider IS NOT NULL GROUP BY llm_provider")
+        sigs = {r["p"]: r for r in cur.fetchall()}
+        cur.execute(
+            "SELECT s.llm_provider AS p, SUM(t.status='CLOSED_WIN') AS w, SUM(t.status='CLOSED_LOSS') AS l "
+            "FROM trades t JOIN signals s ON s.id = t.signal_id WHERE s.llm_provider IS NOT NULL "
+            "AND t.status IN ('CLOSED_WIN','CLOSED_LOSS') GROUP BY s.llm_provider")
+        trades = {r["p"]: r for r in cur.fetchall()}
+    out: Dict[str, Dict[str, Any]] = {}
+    for p, r in sorted(sigs.items(), key=lambda kv: -kv[1]["n"]):
+        t = trades.get(p, {})
+        w, l = int(t.get("w") or 0), int(t.get("l") or 0)
+        out[p] = {
+            "signals": int(r["n"]),
+            "win_rate": _win_rate(w, l),
+            "avg_confidence": round(float(r["conf"]), 1) if r["conf"] is not None else None,
+            "trades_closed": w + l,
+        }
+    return out
+
+
 # ─── Adaptive threshold ───────────────────────────────────────────────────────
 
 def compute_adaptive_score_threshold(symbol: str) -> float:

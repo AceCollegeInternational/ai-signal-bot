@@ -353,6 +353,12 @@ def analytics_factors(api_key: str = Security(get_api_key)):
     return {"factors": analytics_engine.compute_factor_effectiveness()}
 
 
+@app.get("/analytics/providers")
+def analytics_providers(api_key: str = Security(get_api_key)):
+    """Signals, win rate and average confidence per LLM provider."""
+    return analytics_engine.compute_provider_performance()
+
+
 @app.get("/analytics/thresholds")
 def analytics_thresholds(api_key: str = Security(get_api_key)):
     """Adaptive minimum score and enabled flag for every symbol."""

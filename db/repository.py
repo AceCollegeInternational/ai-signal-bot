@@ -113,7 +113,7 @@ SIGNAL_COLUMNS = [
     "rr_tp3", "blended_rr", "macro_trend", "micro_trend", "last_structure_event",
     "premium_discount", "liquidity_sweep", "sweep_direction", "rsi_value", "rsi_zone",
     "rsi_divergence", "macd_crossover", "atr_pips", "atr_state", "volume_state",
-    "best_ob_score", "ob_fvg_overlap", "signal_source", "gate_rejected", "gate_reason",
+    "best_ob_score", "ob_fvg_overlap", "signal_source", "llm_provider", "llm_model", "gate_rejected", "gate_reason",
     "analyst_notes", "raw_json", "source_key",
 ]
 
@@ -182,6 +182,8 @@ def build_signal_row(
         "best_ob_score": sig.get("best_ob_score"),
         "ob_fvg_overlap": int(bool(sig.get("ob_fvg_overlap", 0))),
         "signal_source": source if source in SIGNAL_SOURCES else "LLM",
+        "llm_provider": (str(sig["llm_provider"])[:20] if sig.get("llm_provider") else None),
+        "llm_model": (str(sig["llm_model"])[:64] if sig.get("llm_model") else None),
         "gate_rejected": int(bool(gate_rejected)),
         "gate_reason": (gate_reason or None) and gate_reason[:255],
         "analyst_notes": sig.get("analyst_notes", sig.get("reasoning")),

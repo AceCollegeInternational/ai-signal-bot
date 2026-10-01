@@ -172,6 +172,8 @@ class TradeSignal:
     symbol: str = ""
     timeframe: str = ""
     provider: str = ""
+    llm_provider: Optional[str] = None   # provider that produced this signal (gemini/groq/deepseek/claude)
+    llm_model: Optional[str] = None      # model name that provider used
     raw_response: Dict[str, Any] = field(default_factory=dict)
 
     def is_actionable(self, min_confidence: float = 75.0, min_rr: float = 1.5) -> bool:
@@ -189,13 +191,23 @@ class TradeSignal:
 
 
 class AIProvider(ABC):
+    NAME = ""
+    model_name: Optional[str] = None
+
     @abstractmethod
     def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         pass
 
+    def annotate(self, signal: Any) -> None:
+        """Stamp a signal this provider produced with the provider name and the model it used."""
+        signal.llm_provider = self.NAME or None
+        signal.llm_model = self.model_name
+
 
 class AnthropicProvider(AIProvider):
+    NAME = "claude"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         import anthropic
 
         self.client = anthropic.Anthropic(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
@@ -215,7 +227,9 @@ class AnthropicProvider(AIProvider):
 
 
 class GeminiProvider(AIProvider):
+    NAME = "gemini"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
@@ -250,7 +264,9 @@ class GeminiProvider(AIProvider):
 
 
 class GroqProvider(AIProvider):
+    NAME = "groq"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         from groq import Groq
 
         self.client = Groq(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
@@ -272,11 +288,13 @@ class GroqProvider(AIProvider):
 
 
 class DeepSeekProvider(AIProvider):
+    NAME = "deepseek"
     """DeepSeek via its OpenAI-compatible API."""
 
     BASE_URL = "https://api.deepseek.com"
 
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         from openai import OpenAI
 
         self.client = OpenAI(
@@ -456,6 +474,7 @@ class AISignalEngine:
 
                 signal = self._parse_response(raw_text, symbol, timeframe)
                 signal.provider = provider_name
+                provider.annotate(signal)  # llm_provider / llm_model, from the provider's own name and model
                 return signal
 
             except Exception as e:

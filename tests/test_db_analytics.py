@@ -305,3 +305,48 @@ def test_startup_migrates_legacy_files_once(tmp_path, monkeypatch):
     assert repository.list_trades()["total"] == 1
     startup_db()  # flag set -> skipped, still one row
     assert repository.list_trades()["total"] == 1
+
+
+def _prov_signal(provider, model, score, win=None):
+    """Insert a signal (+ closed trade when win is True/False) attributed to an LLM provider."""
+    sid = repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "confidence": score, "entry_price": 1.1,
+                                    "stop_loss": 1.09, "llm_provider": provider, "llm_model": model})
+    if win is not None:
+        with get_db() as cur:
+            cur.execute("INSERT INTO trades (signal_id, symbol, direction, entry_actual, sl_actual) "
+                        "VALUES (%s,'EURUSD','LONG',1.1,1.09)", (sid,))
+            tid = cur.lastrowid
+        repository.update_trade_outcome(tid, 1.11 if win else 1.09, "TP1" if win else "SL", None, 10 if win else -10)
+    return sid
+
+
+def test_provider_and_model_stored_and_null_ok():
+    sid = _prov_signal("deepseek", "deepseek-chat", 80)
+    none_id = repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "entry_price": 1.1, "stop_loss": 1.09})
+    rows = {r["id"]: r for r in repository.list_signals()["items"]}
+    assert (rows[sid]["llm_provider"], rows[sid]["llm_model"]) == ("deepseek", "deepseek-chat")
+    assert rows[none_id]["llm_provider"] is None and rows[none_id]["llm_model"] is None  # NULL, no error
+
+
+def test_schema_has_llm_columns():
+    with get_db() as cur:
+        cur.execute("SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH AS n FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='signals' AND COLUMN_NAME IN ('llm_provider','llm_model')")
+        cols = {r["COLUMN_NAME"]: r["n"] for r in cur.fetchall()}
+    assert cols == {"llm_provider": 20, "llm_model": 64}
+
+
+def test_providers_endpoint():
+    for _ in range(3):
+        _prov_signal("gemini", "gemini-2.5-flash", 70, win=True)
+    _prov_signal("gemini", "gemini-2.5-flash", 80, win=False)
+    _prov_signal("groq", "llama3-70b-8192", 60)  # no closed trades
+    repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "entry_price": 1.1, "stop_loss": 1.09})  # unattributed
+    with TestClient(app) as c:
+        assert c.get("/analytics/providers").status_code == 403
+        r = c.get("/analytics/providers", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"gemini", "groq"}
+    assert body["gemini"] == {"signals": 4, "win_rate": 75.0, "avg_confidence": 72.5, "trades_closed": 4}
+    assert body["groq"]["signals"] == 1 and body["groq"]["win_rate"] is None and body["groq"]["avg_confidence"] == 60.0
