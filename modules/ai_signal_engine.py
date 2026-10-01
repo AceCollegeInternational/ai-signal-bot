@@ -180,6 +180,41 @@ class GroqProvider(AIProvider):
         return chat_completion.choices[0].message.content
 
 
+class DeepSeekProvider(AIProvider):
+    """DeepSeek via its OpenAI-compatible API."""
+
+    BASE_URL = "https://api.deepseek.com"
+
+    def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        from openai import OpenAI
+
+        self.client = OpenAI(api_key=api_key, base_url=self.BASE_URL)
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+    def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+        )
+        return response.choices[0].message.content
+
+
+# Fallback order per primary: primary -> secondary -> tertiary (claude stays last, as before).
+PROVIDER_CHAINS: Dict[str, List[str]] = {
+    "deepseek": ["deepseek", "groq", "gemini", "claude"],
+    "groq": ["groq", "deepseek", "gemini", "claude"],
+    "gemini": ["gemini", "deepseek", "groq", "claude"],
+    "claude": ["claude", "groq", "deepseek", "gemini"],
+}
+
+
 # ─── Main Engine ──────────────────────────────────────────────────────────────
 
 
@@ -192,7 +227,7 @@ class AISignalEngine:
         self.providers: Dict[str, AIProvider] = {}
         self._init_providers(ai_cfg)
 
-        self.primary = ai_cfg.get("primary_provider", "gemini")
+        self.primary = (os.getenv("AI_PRIMARY") or ai_cfg.get("primary_provider", "gemini")).strip().lower()
         self.fallback_enabled = ai_cfg.get("fallback_enabled", True)
         self._no_provider_logged = False
 
@@ -200,7 +235,10 @@ class AISignalEngine:
         sig_cfg = config.get("signals", {})
         self.min_confidence = sig_cfg.get("min_confidence", 75.0)
 
-        log.info(f"AISignalEngine init with primary={self.primary}")
+        chain = self.provider_order()
+        log.info(
+            f"[AI] Signal engine init — primary={self.primary} fallback={chain[1:] if chain and chain[0] == self.primary else chain}"
+        )
 
     def _init_providers(self, ai_cfg: Dict[str, Any]):
         # Gemini
@@ -224,6 +262,19 @@ class AISignalEngine:
                 cfg.get("max_tokens", 1000),
                 cfg.get("temperature", 0.1),
             )
+
+        # DeepSeek (OpenAI-compatible)
+        ds_key = os.getenv("DEEPSEEK_API_KEY")
+        if ds_key:
+            cfg = ai_cfg.get("deepseek", {})
+            self.providers["deepseek"] = DeepSeekProvider(
+                ds_key,
+                os.getenv("DEEPSEEK_MODEL") or cfg.get("model", "deepseek-chat"),
+                cfg.get("max_tokens", 1000),
+                cfg.get("temperature", 0.1),
+            )
+        else:
+            log.warning("[AI] DeepSeek provider not configured — DEEPSEEK_API_KEY missing.")
 
         # Claude (Legacy support / Optional)
         ant_key = os.getenv("ANTHROPIC_API_KEY")
@@ -277,17 +328,18 @@ class AISignalEngine:
             "higher_timeframe_context": htf_context or {},
         }
 
+    def provider_order(self) -> List[str]:
+        """Return configured providers in call order: primary, then the fallback chain."""
+        chain = PROVIDER_CHAINS.get(self.primary, [self.primary] + [p for p in PROVIDER_CHAINS["groq"] if p != self.primary])
+        ordered = [p for p in chain if p in self.providers]
+        if not self.fallback_enabled:
+            ordered = ordered[:1] if ordered and ordered[0] == self.primary else []
+        return ordered
+
     def get_signal(
         self, payload: Dict[str, Any], symbol: str = "", timeframe: str = ""
     ) -> TradeSignal:
-        ordered_providers = []
-        if self.primary in self.providers:
-            ordered_providers.append(self.primary)
-
-        if self.fallback_enabled:
-            for p in ["gemini", "groq", "claude"]:
-                if p in self.providers and p not in ordered_providers:
-                    ordered_providers.append(p)
+        ordered_providers = self.provider_order()
 
         if not ordered_providers:
             if not self._no_provider_logged:

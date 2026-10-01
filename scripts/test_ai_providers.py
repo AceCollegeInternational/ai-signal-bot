@@ -1,7 +1,7 @@
 """
 scripts/test_ai_providers.py
 ────────────────────────────
-Quick test script to verify AI providers (Gemini, Groq, Claude)
+Quick test script to verify AI providers (Gemini, Groq, DeepSeek, Claude)
 independently of the full trading bot.
 """
 
@@ -41,7 +41,7 @@ def generate_mock_data():
 def main():
     parser = argparse.ArgumentParser(description="Test AI Providers")
     parser.add_argument(
-        "--provider", choices=["gemini", "groq", "claude"], help="Provider to test"
+        "--provider", choices=["gemini", "groq", "deepseek", "claude"], help="Provider to test"
     )
     args = parser.parse_args()
 
