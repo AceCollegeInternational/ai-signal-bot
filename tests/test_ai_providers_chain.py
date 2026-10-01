@@ -213,3 +213,57 @@ def test_parse_response_handles_fenced_reply_and_logs_raw_on_failure(env):
     bad = engine._parse_response('```json\n{"signal": "BUY", "confidence": ', "EURUSD", "1h")  # truncated reply
     assert bad.signal == "HOLD"
     assert any("[AI] Raw response that failed parsing:" in d for d in debug)
+
+
+# ─── truncated JSON recovery / max_tokens ────────────────────────────────────
+
+FULL = {"signal": "BUY", "confidence": 80, "entry_price": 1.1, "stop_loss": 1.09, "take_profit_1": 1.12,
+        "take_profit_2": 1.13, "reasoning": "trend {up} and \"strong\"", "key_patterns": ["a", "b"],
+        "risk_reward_ratio": 2.0}
+
+
+def test_extract_json_recovers_truncated_reply():
+    text = json.dumps(FULL)
+    cut = text[: text.index('"reasoning"') + 30]  # cut inside the reasoning string
+    assert ase.extract_json(cut)["take_profit_2"] == 1.13
+    assert ase.extract_json('{"signal": "BUY", "k": {"x": 1}, "list": [1, 2,')["list"] == [1, 2]
+
+
+def test_extract_json_truncation_after_nested_close_is_recovered():
+    # last '}' belongs to a nested object, so the outer object is still open
+    d = ase.extract_json('{"signal": "BUY", "meta": {"x": 1}, "reasoning": "cut off her')
+    assert d["meta"] == {"x": 1} and d["reasoning"] == "cut off her"
+
+
+def test_extract_json_unrecoverable_truncation_raises():
+    with pytest.raises(ValueError, match="Truncated JSON, recovery failed"):
+        ase.extract_json('{"signal" "BUY" "confidence"')
+
+
+def test_extract_json_drops_number_cut_mid_value():
+    d = ase.extract_json('{"signal": "BUY", "confidence": 80, "entry_price": 1.10')
+    assert "entry_price" not in d  # may be 1.10893 truncated — never trust it
+
+
+def test_truncated_reply_missing_price_levels_becomes_hold(env):
+    engine, _ = build(env, "groq")
+    sig = engine._parse_response('{"signal": "BUY", "confidence": 80, "entry_price": 1.10', "EURUSD", "1h")
+    assert sig.signal == "HOLD"
+
+
+def test_truncated_reply_with_all_required_fields_is_recovered(env):
+    engine, _ = build(env, "groq")
+    text = json.dumps(FULL)
+    sig = engine._parse_response(text[: text.index('"reasoning"') + 30], "EURUSD", "1h")
+    assert sig.signal == "BUY" and sig.entry_price == 1.1 and sig.take_profit_1 == 1.12
+
+
+def test_all_providers_default_to_2000_max_tokens(env):
+    import yaml
+    cfg = yaml.safe_load(open("config.yaml"))["ai"]
+    for name in ("gemini", "groq", "deepseek", "claude"):
+        assert cfg[name]["max_tokens"] == 2000, name
+    # code defaults (used when config omits the key) match
+    env.setenv("DEEPSEEK_API_KEY", "k")
+    engine = ase.AISignalEngine({"ai": {"primary_provider": "deepseek"}})
+    assert engine.providers["deepseek"].max_tokens == 2000

@@ -32,16 +32,64 @@ PROVIDER_TIMEOUT_S = float(os.getenv("AI_PROVIDER_TIMEOUT", "30"))
 HARD_DEADLINE_S = PROVIDER_TIMEOUT_S + 1.0
 
 
-def extract_json(text: str) -> dict:
-    """Extract the outermost JSON object from an LLM reply (handles fences and surrounding prose)."""
+REQUIRED_SIGNAL_KEYS = ("signal", "confidence", "entry_price", "stop_loss", "take_profit_1")
+
+
+def _close_truncated_json(chunk: str) -> str:
+    """Close a JSON fragment cut off mid-reply: end an open string, drop a dangling key/comma, add closers."""
+    stack: List[str] = []
+    in_str = esc = False
+    for ch in chunk:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        if esc:  # cut right after a backslash — drop it so the closing quote is not escaped
+            chunk = chunk[:-1]
+        chunk += '"'
+    chunk = chunk.rstrip()
+    # a number at the very end may itself be cut short (1.10 of 1.10893) — never trust it
+    chunk = re.sub(r',?\s*"[^"\\]*"\s*:\s*-?[\d.]+(?:[eE][+-]?\d*)?$', "", chunk) if not in_str else chunk
+    # drop a trailing comma or a key with no value yet ("key": / "key")
+    chunk = re.sub(r',\s*$', "", chunk)
+    chunk = re.sub(r',?\s*"[^"\\]*"\s*:\s*$', "", chunk)
+    return chunk + "".join(reversed(stack))
+
+
+def extract_json_ex(text: str) -> tuple:
+    """Return (dict, recovered) for the outermost JSON object in an LLM reply; recovered=True if it was truncated."""
     if not text:
         raise ValueError("Empty response")
     text = re.sub(r"```(?:json)?\s*", "", text)
     text = text.replace("```", "").strip()
     start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         raise ValueError(f"No JSON object found in response: {text[:200]}")
-    return json.loads(text[start:end + 1])
+    if end > start:
+        try:
+            return json.loads(text[start:end + 1]), False
+        except json.JSONDecodeError:
+            pass  # the last '}' may belong to a nested object of a truncated reply — try recovery
+    # Response truncated before the closing brace — close what is open and retry
+    try:
+        return json.loads(_close_truncated_json(text[start:])), True
+    except json.JSONDecodeError:
+        raise ValueError(f"Truncated JSON, recovery failed: {text[:200]}")
+
+
+def extract_json(text: str) -> dict:
+    """Extract the outermost JSON object from an LLM reply (handles fences, prose and truncation)."""
+    return extract_json_ex(text)[0]
 
 
 def call_with_deadline(fn, deadline_s: float):
@@ -293,7 +341,7 @@ class AISignalEngine:
             self.providers["gemini"] = GeminiProvider(
                 gem_key,
                 os.getenv("GEMINI_MODEL") or cfg.get("model", "gemini-2.5-flash"),
-                cfg.get("max_tokens", 1000),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
 
@@ -304,7 +352,7 @@ class AISignalEngine:
             self.providers["groq"] = GroqProvider(
                 groq_key,
                 os.getenv("GROQ_MODEL") or cfg.get("model", "llama3-70b-8192"),
-                cfg.get("max_tokens", 1000),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
 
@@ -315,7 +363,7 @@ class AISignalEngine:
             self.providers["deepseek"] = DeepSeekProvider(
                 ds_key,
                 os.getenv("DEEPSEEK_MODEL") or cfg.get("model", "deepseek-chat"),
-                cfg.get("max_tokens", 1000),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
         else:
@@ -328,7 +376,7 @@ class AISignalEngine:
             self.providers["claude"] = AnthropicProvider(
                 ant_key,
                 cfg.get("model", "claude-3-5-sonnet-20240620"),
-                cfg.get("max_tokens", 1000),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
 
@@ -433,7 +481,12 @@ class AISignalEngine:
     def _parse_response(self, text: str, symbol: str, timeframe: str) -> TradeSignal:
         raw = text or ""
         try:
-            data = extract_json(raw)
+            data, recovered = extract_json_ex(raw)
+            if recovered:
+                missing = [k for k in REQUIRED_SIGNAL_KEYS if k not in data]
+                if missing:  # never trade on a truncated reply that lost its price levels
+                    raise ValueError(f"Truncated response missing required fields: {missing}")
+                log.warning("[AI] Response was truncated; recovered by auto-closing the JSON.")
             return TradeSignal(
                 signal=data.get("signal", "HOLD").upper(),
                 confidence=float(data.get("confidence", 0)),

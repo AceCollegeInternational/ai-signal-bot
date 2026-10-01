@@ -56,21 +56,21 @@ ai:
   gemini:
     model: "gemini-2.5-flash"  # overridden by GEMINI_MODEL env var
     temperature: 0.1
-    max_tokens: 1000
+    max_tokens: 2000
     
   deepseek:
     model: "deepseek-chat"  # overridden by DEEPSEEK_MODEL env var; "deepseek-reasoner" = R1
     temperature: 0.1
-    max_tokens: 1000
+    max_tokens: 2000
 
   groq:
     model: "llama3-70b-8192"  # overridden by GROQ_MODEL env var
     temperature: 0.1
-    max_tokens: 1000
+    max_tokens: 2000
 
   claude: # Backwards compatibility
     model: "claude-sonnet-4-20250514"
-    max_tokens: 1000
+    max_tokens: 2000
     temperature: 0.1
 
 fundamental_analysis:
