@@ -14,6 +14,7 @@ Workflow:
 
 import json
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -29,6 +30,18 @@ log = get_logger(__name__)
 PROVIDER_TIMEOUT_S = float(os.getenv("AI_PROVIDER_TIMEOUT", "30"))
 # Hard wall-clock cap enforced by the engine itself, in case an SDK timeout does not cover a stall (e.g. DNS).
 HARD_DEADLINE_S = PROVIDER_TIMEOUT_S + 1.0
+
+
+def extract_json(text: str) -> dict:
+    """Extract the outermost JSON object from an LLM reply (handles fences and surrounding prose)."""
+    if not text:
+        raise ValueError("Empty response")
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = text.replace("```", "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"No JSON object found in response: {text[:200]}")
+    return json.loads(text[start:end + 1])
 
 
 def call_with_deadline(fn, deadline_s: float):
@@ -418,14 +431,9 @@ class AISignalEngine:
         return self.get_signal(payload, symbol, timeframe)
 
     def _parse_response(self, text: str, symbol: str, timeframe: str) -> TradeSignal:
-        # Simple extraction for JSON in markdown fences
-        if "```" in text:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            text = text[start:end]
-
+        raw = text or ""
         try:
-            data = json.loads(text)
+            data = extract_json(raw)
             return TradeSignal(
                 signal=data.get("signal", "HOLD").upper(),
                 confidence=float(data.get("confidence", 0)),
@@ -442,6 +450,10 @@ class AISignalEngine:
                 timeframe=timeframe,
                 raw_response=data,
             )
+        except (json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[AI] Raw response that failed parsing: {raw[:300]}")
+            log.error(f"Parse error: {e}")
+            return self._hold_signal(symbol, timeframe, f"Parse failed: {e}")
         except Exception as e:
             log.error(f"Parse error: {e}")
             return self._hold_signal(symbol, timeframe, f"Parse failed: {e}")

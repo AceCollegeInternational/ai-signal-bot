@@ -175,3 +175,41 @@ def test_gemini_call_passes_request_timeout(env):
     g.model, g.has_sys_prompt = FakeModel(), True
     assert g.generate_content("sys", "user") == GOOD
     assert seen["request_options"]["timeout"] == 30.0
+
+
+# ─── extract_json ─────────────────────────────────────────────────────────────
+
+def test_extract_json_fenced():
+    assert ase.extract_json('```json\n{"signal": "BUY", "confidence": 80}\n```') == {"signal": "BUY", "confidence": 80}
+    assert ase.extract_json('```\n{"a": 1}\n```') == {"a": 1}
+
+
+def test_extract_json_raw():
+    assert ase.extract_json('{"signal": "HOLD"}') == {"signal": "HOLD"}
+
+
+def test_extract_json_prose_before_and_after():
+    text = 'Sure! Here is my analysis:\n```json\n{"signal": "SELL", "n": {"x": 1}}\n```\nHope that helps.'
+    assert ase.extract_json(text) == {"signal": "SELL", "n": {"x": 1}}
+
+
+def test_extract_json_empty_raises():
+    for bad in ("", None):
+        with pytest.raises(ValueError, match="Empty response"):
+            ase.extract_json(bad)
+
+
+def test_extract_json_no_object_raises():
+    with pytest.raises(ValueError, match="No JSON object found"):
+        ase.extract_json("I cannot provide a signal right now.")
+
+
+def test_parse_response_handles_fenced_reply_and_logs_raw_on_failure(env):
+    debug = []
+    env.setattr(ase.log, "debug", lambda msg, *a, **k: debug.append(str(msg)))
+    engine, _ = build(env, "groq")
+    sig = engine._parse_response("```json\n" + GOOD + "\n```", "EURUSD", "1h")
+    assert sig.signal == "BUY" and sig.confidence == 80
+    bad = engine._parse_response('```json\n{"signal": "BUY", "confidence": ', "EURUSD", "1h")  # truncated reply
+    assert bad.signal == "HOLD"
+    assert any("[AI] Raw response that failed parsing:" in d for d in debug)
