@@ -1,3 +1,6 @@
+# ─── WSGI Adapter for StackCP ────────────────────────────────────────────────
+a2wsgi
+
 # ─── Core Exchange & Data ────────────────────────────────────────────────────
 ccxt==4.3.95
 # ccxt.pro==4.3.95      # requires private license - comment out if not using
@@ -18,6 +21,11 @@ pyyaml==6.0.1
 # ─── API Server ──────────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn==0.30.1
+
+# ─── MySQL / Scheduling ──────────────────────────────────────────────────────
+PyMySQL==1.1.1
+DBUtils==3.1.0
+APScheduler==3.10.4
 
 # ─── Async Networking ────────────────────────────────────────────────────────
 aiohttp==3.9.5
