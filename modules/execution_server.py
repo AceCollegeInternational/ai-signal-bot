@@ -18,6 +18,7 @@ Endpoints:
     GET  /health          — Health check
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, Security
@@ -32,8 +33,8 @@ from datetime import datetime, timezone
 from modules.market_data_store import market_data_store
 from analytics import engine as analytics_engine
 from db import repository
-from db.connection import DatabaseUnavailableError, db_configured, test_connection
-from db.schema import init_schema
+from db.connection import DatabaseUnavailableError, db_configured, db_get_one
+from db.startup import migration_done, run_and_record_migration, startup_db
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -55,11 +56,7 @@ async def lifespan(_app: FastAPI):
     """Initialise the DB schema and run the analytics scheduler for the app's lifetime."""
     scheduler = None
     if db_configured():
-        if test_connection():
-            try:
-                init_schema()
-            except Exception as exc:
-                log.critical(f"[DB] Schema init failed: {exc}")
+        await asyncio.to_thread(startup_db)  # never raises; logs CRITICAL and degrades if DB is down
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler(timezone="UTC")
         scheduler.add_job(_scheduled(analytics_engine.generate_performance_report, "daily_report"),
@@ -370,6 +367,18 @@ def analytics_unpause(symbol: str, api_key: str = Security(get_api_key)):
     return {"symbol": symbol.upper(), "status": "re-enabled", "message": "Manual override applied"}
 
 
+@app.post("/admin/db-migrate")
+def admin_db_migrate(force: bool = False, api_key: str = Security(get_api_key)):
+    """Re-run the legacy-file migration (skipped if already done unless ?force=true)."""
+    if not force and migration_done():
+        return {"status": "already_done",
+                "message": "Migration already completed. Pass ?force=true to re-run."}
+    r = run_and_record_migration()
+    return {"status": "complete" if not r["errors"] else "failed",
+            "records_found": r["records_found"], "records_inserted": r["records_inserted"],
+            "records_skipped": r["records_skipped"], "errors": r["errors"]}
+
+
 @app.post("/analytics/refresh")
 def analytics_refresh(api_key: str = Security(get_api_key)):
     """Re-run all analytics computations."""
@@ -526,9 +535,20 @@ async def poll_position_event(symbol: str):
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
+    """Public health check: app uptime plus DB connectivity and migration status."""
+    db_state, migration = "unreachable", "unknown"
+    try:
+        db_get_one("SELECT 1 AS ok")
+        db_state = "connected"
+        migration = "completed" if migration_done() else "pending"
+    except Exception:
+        pass
     return {
-        "status": "ok",
+        "status": "ok" if db_state == "connected" else "degraded",
+        "db": db_state,
+        "migration": migration,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "uptime_seconds": int(time.time() - bot_status["server_start_time"]),
         "signals_tracked": len(latest_analysis),
         "pending_position_event_symbols": len(pending_position_events),

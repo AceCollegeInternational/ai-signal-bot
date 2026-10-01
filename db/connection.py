@@ -146,3 +146,17 @@ def create_tables() -> None:
     """Create all tables on the configured database (alias for db.schema.init_schema)."""
     from db.schema import init_schema
     init_schema()
+
+
+def db_get_one(sql: str, params: tuple = ()) -> Optional[dict]:
+    """Run a parameterised SELECT and return the first row (or None)."""
+    with get_db() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def db_execute(sql: str, params: tuple = ()) -> int:
+    """Run a parameterised write statement in its own transaction; return affected rows."""
+    with get_db() as cur:
+        cur.execute(sql, params)
+        return cur.rowcount

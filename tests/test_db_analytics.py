@@ -32,7 +32,7 @@ def clean_db():
     init_schema()
     with get_db() as cur:
         cur.execute("SET FOREIGN_KEY_CHECKS=0")
-        for t in ("trades", "signals", "performance_daily", "performance_by_symbol", "factor_effectiveness"):
+        for t in ("trades", "signals", "performance_daily", "performance_by_symbol", "factor_effectiveness", "app_settings"):
             cur.execute(f"TRUNCATE TABLE {t}")
         cur.execute("SET FOREIGN_KEY_CHECKS=1")
 
@@ -252,3 +252,56 @@ def test_thresholds_include_pause_fields():
     assert {"paused_at", "pause_reason", "days_until_recovery", "recommended_min_score", "signal_enabled"} <= set(t["GBPUSD"])
     assert t["GBPUSD"]["signal_enabled"] is False and t["GBPUSD"]["days_until_recovery"] == 7
     assert t["EURUSD"]["paused_at"] is None and t["EURUSD"]["days_until_recovery"] is None
+
+
+def test_health_db_connected():
+    from db.startup import startup_db
+    assert startup_db() is True
+    r = TestClient(app).get("/health")
+    body = r.json()
+    assert r.status_code == 200 and body["status"] == "ok" and body["db"] == "connected"
+    assert body["migration"] == "completed" and body["timestamp"].endswith("Z")
+
+
+def test_health_db_unreachable(monkeypatch):
+    from db import connection
+    connection.reset_pool()
+    monkeypatch.setenv("DB_PORT", "1")
+    monkeypatch.setenv("DB_CONNECT_TIMEOUT", "1")
+    try:
+        r = TestClient(app).get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "degraded" and r.json()["db"] == "unreachable" and r.json()["migration"] == "unknown"
+        from db.startup import startup_db
+        assert startup_db() is False  # degrades, does not raise
+    finally:
+        monkeypatch.undo()
+        connection.reset_pool()
+
+
+def test_admin_migrate_already_done_then_force(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # empty ./logs -> nothing to migrate
+    c = TestClient(app)
+    assert c.post("/admin/db-migrate").status_code == 403
+    first = c.post("/admin/db-migrate", headers=H).json()
+    assert first["status"] == "complete" and first["errors"] == []
+    second = c.post("/admin/db-migrate", headers=H).json()
+    assert second == {"status": "already_done",
+                      "message": "Migration already completed. Pass ?force=true to re-run."}
+    forced = c.post("/admin/db-migrate?force=true", headers=H).json()
+    assert forced["status"] == "complete" and set(forced) == {
+        "status", "records_found", "records_inserted", "records_skipped", "errors"}
+
+
+def test_startup_migrates_legacy_files_once(tmp_path, monkeypatch):
+    import json
+    from db.startup import startup_db
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "trade_lifecycle.txt").write_text(json.dumps(
+        {"event": "OPEN", "timestamp_utc": "2026-09-01T08:00:00+00:00", "trade_id": "EURUSD-1", "symbol": "EURUSD",
+         "direction": "long", "entry_price": 1.1, "size": 10000, "stop_loss": 1.09, "take_profit_1": 1.12}) + "\n")
+    monkeypatch.chdir(tmp_path)
+    startup_db()
+    assert repository.list_trades()["total"] == 1
+    startup_db()  # flag set -> skipped, still one row
+    assert repository.list_trades()["total"] == 1

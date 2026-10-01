@@ -141,6 +141,13 @@ DDL: List[str] = [
         last_computed_at        DATETIME
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS app_settings (
+        `key`       VARCHAR(64) PRIMARY KEY,
+        value       TEXT,
+        updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+    """,
 ]
 
 # (table, column, definition) — added when an older deployment lacks the column.
