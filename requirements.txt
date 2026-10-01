@@ -50,3 +50,8 @@ dill
 imageio
 ipywidgets>=7.0.0
 mypy_extensions
+
+# ─── Testing ─────────────────────────────────────────────────────────────────
+pytest
+pytest-asyncio
+httpx
