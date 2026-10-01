@@ -54,12 +54,12 @@ ai:
   fallback_enabled: true
   
   gemini:
-    model: "gemini-2.0-flash"
+    model: "gemini-2.5-flash"  # overridden by GEMINI_MODEL env var
     temperature: 0.1
     max_tokens: 1000
     
   groq:
-    model: "llama-3.3-70b-versatile"
+    model: "llama3-70b-8192"  # overridden by GROQ_MODEL env var
     temperature: 0.1
     max_tokens: 1000
 

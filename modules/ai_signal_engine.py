@@ -209,7 +209,7 @@ class AISignalEngine:
             cfg = ai_cfg.get("gemini", {})
             self.providers["gemini"] = GeminiProvider(
                 gem_key,
-                cfg.get("model", "gemini-2.0-flash"),
+                os.getenv("GEMINI_MODEL") or cfg.get("model", "gemini-2.5-flash"),
                 cfg.get("max_tokens", 1000),
                 cfg.get("temperature", 0.1),
             )
@@ -220,7 +220,7 @@ class AISignalEngine:
             cfg = ai_cfg.get("groq", {})
             self.providers["groq"] = GroqProvider(
                 groq_key,
-                cfg.get("model", "llama-3.3-70b-versatile"),
+                os.getenv("GROQ_MODEL") or cfg.get("model", "llama3-70b-8192"),
                 cfg.get("max_tokens", 1000),
                 cfg.get("temperature", 0.1),
             )

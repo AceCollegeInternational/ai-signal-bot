@@ -771,14 +771,6 @@ def main():
     parser.add_argument("--timeframe", help="Override timeframe")
     args = parser.parse_args()
 
-    # Render web services expect a bound port; keep a tiny health endpoint open.
-    port = os.getenv("PORT")
-    if port and not args.backtest:
-        try:
-            start_health_server(int(port))
-        except Exception as exc:
-            log.warning(f"Failed to start health server on PORT={port}: {exc}")
-
     # Load Config
     config = load_config("config.yaml")
 
