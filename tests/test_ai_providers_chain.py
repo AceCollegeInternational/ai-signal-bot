@@ -1,6 +1,7 @@
 """Provider chain tests: DeepSeek support and switchable primary (no network, no real SDKs)."""
 
 import json
+import time
 
 import pytest
 
@@ -94,3 +95,83 @@ def test_real_deepseek_provider_wiring(env):
     p = engine.providers["deepseek"]
     assert str(p.client.base_url).startswith("https://api.deepseek.com")
     assert p.model == "deepseek-reasoner" and p.temperature == 0.1
+
+
+def _hanging_deepseek(seconds, calls):
+    """Provider class whose API call blocks for `seconds` (simulates a stalled network call)."""
+    class Hang(ase.AIProvider):
+        def __init__(self, *a, **k):
+            pass
+
+        def generate_content(self, system_prompt, user_prompt):
+            calls.append("deepseek")
+            time.sleep(seconds)
+            return GOOD
+    return Hang
+
+
+def _failure_logger(env):
+    warnings = []
+    env.setattr(ase.log, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+    return warnings
+
+
+def test_deepseek_hang_times_out_within_32s_and_falls_through(env):
+    """API hangs 35s: the engine must give up in <32s, log 'deepseek failed:' and use Groq."""
+    calls = []
+    warnings = _failure_logger(env)
+    engine, _ = build(env, "deepseek", calls=calls)
+    env.setattr(ase, "PROVIDER_TIMEOUT_S", 30.0)
+    env.setattr(ase, "HARD_DEADLINE_S", 31.0)
+    engine.providers["deepseek"] = _hanging_deepseek(35, calls)()
+    start = time.monotonic()
+    sig = engine.get_signal({}, "EURUSD", "1h")
+    elapsed = time.monotonic() - start
+    assert elapsed < 32, f"engine blocked for {elapsed:.1f}s"
+    assert any(w.startswith("deepseek failed:") for w in warnings)
+    assert calls == ["deepseek", "groq"] and sig.provider == "groq" and sig.signal == "BUY"
+
+
+def test_deepseek_timeout_exception_falls_through(env):
+    """An SDK Timeout error is logged as 'deepseek failed:' and the chain continues."""
+    class TimeoutErr(Exception):
+        pass
+
+    calls = []
+    warnings = _failure_logger(env)
+    engine, _ = build(env, "deepseek", calls=calls)
+
+    class Raises(ase.AIProvider):
+        def generate_content(self, system_prompt, user_prompt):
+            calls.append("deepseek")
+            raise TimeoutErr("Request timed out.")
+
+    engine.providers["deepseek"] = Raises()
+    assert engine.get_signal({}, "EURUSD", "1h").provider == "groq"
+    assert any(w.startswith("deepseek failed:") and "timed out" in w for w in warnings)
+
+
+def test_sdk_clients_are_configured_with_timeouts(env):
+    """Real Groq/DeepSeek/Gemini wrappers pass a 30s timeout and disable retries."""
+    pytest.importorskip("openai")
+    env.setenv("DEEPSEEK_API_KEY", "sk-test")
+    p = ase.DeepSeekProvider("sk-test", "deepseek-chat", 1000, 0.1)
+    assert p.client.timeout == ase.PROVIDER_TIMEOUT_S == 30.0 and p.client.max_retries == 0
+    groq = pytest.importorskip("groq")
+    g = ase.GroqProvider("gsk-test", "llama3-70b-8192", 1000, 0.1)
+    assert g.client.timeout == 30.0 and g.client.max_retries == 0
+
+
+def test_gemini_call_passes_request_timeout(env):
+    seen = {}
+
+    class FakeModel:
+        def generate_content(self, prompt, **kw):
+            seen.update(kw)
+            class R: text = GOOD
+            return R()
+
+    g = ase.GeminiProvider.__new__(ase.GeminiProvider)
+    g.model, g.has_sys_prompt = FakeModel(), True
+    assert g.generate_content("sys", "user") == GOOD
+    assert seen["request_options"]["timeout"] == 30.0

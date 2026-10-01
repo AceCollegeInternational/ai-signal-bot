@@ -14,6 +14,7 @@ Workflow:
 
 import json
 import os
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type
@@ -23,6 +24,31 @@ import pandas as pd
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# A hung provider must fail fast and fall through to the next one.
+PROVIDER_TIMEOUT_S = float(os.getenv("AI_PROVIDER_TIMEOUT", "30"))
+# Hard wall-clock cap enforced by the engine itself, in case an SDK timeout does not cover a stall (e.g. DNS).
+HARD_DEADLINE_S = PROVIDER_TIMEOUT_S + 1.0
+
+
+def call_with_deadline(fn, deadline_s: float):
+    """Run fn() in a daemon thread and raise TimeoutError if it has not finished within deadline_s."""
+    box: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # propagate any provider error to the caller
+            box["error"] = exc
+
+    t = threading.Thread(target=runner, daemon=True, name="llm-call")
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        raise TimeoutError(f"no response within {deadline_s:g}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 # ─── System prompt for all providers ───────────────────
 SYSTEM_PROMPT = """You are an expert quantitative technical analyst and algorithmic trader with 20+ years of experience. 
@@ -111,7 +137,7 @@ class AnthropicProvider(AIProvider):
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
         import anthropic
 
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -152,9 +178,13 @@ class GeminiProvider(AIProvider):
     def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         if not self.has_sys_prompt:
             combined_prompt = f"{system_prompt}\n\nUser context:\n{user_prompt}"
-            response = self.model.generate_content(combined_prompt)
+            response = self.model.generate_content(
+                combined_prompt, request_options={"timeout": PROVIDER_TIMEOUT_S}
+            )
         else:
-            response = self.model.generate_content(user_prompt)
+            response = self.model.generate_content(
+                user_prompt, request_options={"timeout": PROVIDER_TIMEOUT_S}
+            )
         return response.text
 
 
@@ -162,7 +192,7 @@ class GroqProvider(AIProvider):
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
         from groq import Groq
 
-        self.client = Groq(api_key=api_key)
+        self.client = Groq(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -188,7 +218,9 @@ class DeepSeekProvider(AIProvider):
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
         from openai import OpenAI
 
-        self.client = OpenAI(api_key=api_key, base_url=self.BASE_URL)
+        self.client = OpenAI(
+            api_key=api_key, base_url=self.BASE_URL, timeout=PROVIDER_TIMEOUT_S, max_retries=0
+        )
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -353,7 +385,10 @@ class AISignalEngine:
             try:
                 log.info(f"Requesting signal via {provider_name}...")
                 provider = self.providers[provider_name]
-                raw_text = provider.generate_content(SYSTEM_PROMPT, payload_json)
+                raw_text = call_with_deadline(
+                    lambda: provider.generate_content(SYSTEM_PROMPT, payload_json),
+                    HARD_DEADLINE_S,
+                )
 
                 if not raw_text:
                     continue
