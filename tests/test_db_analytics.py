@@ -1,7 +1,7 @@
 """Integration tests for the MySQL layer, analytics engine, gate and API.
 
 Run only against a disposable database: set FXGURU_TEST_DB=1 plus DB_* env vars.
-The tests TRUNCATE the signal/trade/analytics tables.
+The tests TRUNCATE the signal/trade/analytics tables, so DB_NAME must contain "test".
 """
 
 import os
@@ -11,6 +11,9 @@ import pytest
 pytestmark = pytest.mark.skipif(
     os.getenv("FXGURU_TEST_DB") != "1", reason="set FXGURU_TEST_DB=1 with a disposable DB_* to run"
 )
+
+if os.getenv("FXGURU_TEST_DB") == "1" and "test" not in os.getenv("DB_NAME", "").lower():
+    raise RuntimeError("Refusing to run destructive tests: DB_NAME must contain 'test'")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -121,7 +124,7 @@ def test_gate():
         cur.execute("UPDATE trades SET status='CLOSED_LOSS' WHERE symbol='EURUSD'")
     engine.compute_symbol_performance("EURUSD")
     ok, why = engine.should_take_signal({"symbol": "EURUSD", "confidence": 99})
-    assert (ok, why) == (False, "Symbol paused by analytics")
+    assert ok is False and why.startswith("EURUSD paused (win_rate_below_40pct). Auto-recovery in")
 
 
 def test_gate_session_and_factor_penalty():
@@ -169,3 +172,83 @@ def test_db_unavailable_returns_503(monkeypatch):
     finally:
         monkeypatch.undo()
         connection.reset_pool()
+
+
+def _seed_results(symbol, wins, losses):
+    """Insert closed trades with an exact win/loss split."""
+    for i in range(wins + losses):
+        win = i < wins
+        _, tid = repository.insert_signal_and_trade(
+            {"symbol": symbol, "direction": "LONG", "entry_price": 1.3, "stop_loss": 1.295, "confidence": 85}, {})
+        repository.update_trade_outcome(tid, 1.305 if win else 1.295, "TP1" if win else "SL", None, 50 if win else -50)
+
+
+def _row(symbol):
+    with get_db() as cur:
+        cur.execute("SELECT * FROM performance_by_symbol WHERE symbol=%s", (symbol,))
+        return cur.fetchone()
+
+
+def test_no_auto_pause_below_20_trades():
+    _seed_results("GBPUSD", 0, 15)
+    engine.compute_symbol_performance("GBPUSD")
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 1 and r["paused_at"] is None
+
+
+def test_auto_pause_at_20_trades_low_win_rate():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 0 and r["paused_at"] is not None and r["pause_reason"] == "win_rate_below_40pct"
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95})
+    assert not ok and "Auto-recovery in 7d" in why
+
+
+def test_seven_day_recovery_and_no_instant_repause():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with get_db() as cur:
+        cur.execute("UPDATE performance_by_symbol SET paused_at = UTC_TIMESTAMP() - INTERVAL 8 DAY WHERE symbol='GBPUSD'")
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95, "hour_utc": 3})
+    assert ok is True, why
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 1 and r["paused_at"] is None and r["pause_reason"] is None
+    # the old bad history must not re-pause it on the next analytics run
+    engine.compute_symbol_performance("GBPUSD")
+    assert _row("GBPUSD")["signal_enabled"] == 1
+
+
+def test_still_paused_before_seven_days():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with get_db() as cur:
+        cur.execute("UPDATE performance_by_symbol SET paused_at = UTC_TIMESTAMP() - INTERVAL 2 DAY WHERE symbol='GBPUSD'")
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95})
+    assert not ok and "Auto-recovery in 5d" in why
+
+
+def test_manual_unpause_endpoint():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with TestClient(app) as c:
+        r = c.post("/analytics/symbols/GBPUSD/unpause", headers=H)
+        assert r.status_code == 200 and r.json() == {
+            "symbol": "GBPUSD", "status": "re-enabled", "message": "Manual override applied"}
+        assert _row("GBPUSD")["signal_enabled"] == 1
+        engine.compute_symbol_performance("GBPUSD")  # must not instantly re-pause
+        assert _row("GBPUSD")["signal_enabled"] == 1
+        assert c.post("/analytics/symbols/NOPE/unpause", headers=H).status_code == 404
+        assert c.post("/analytics/symbols/GBPUSD/unpause").status_code == 403
+
+
+def test_thresholds_include_pause_fields():
+    _seed_results("GBPUSD", 6, 14)
+    _seed_results("EURUSD", 10, 10)
+    engine.compute_symbol_performance("GBPUSD")
+    engine.compute_symbol_performance("EURUSD")
+    with TestClient(app) as c:
+        t = c.get("/analytics/thresholds", headers=H).json()
+    assert {"paused_at", "pause_reason", "days_until_recovery", "recommended_min_score", "signal_enabled"} <= set(t["GBPUSD"])
+    assert t["GBPUSD"]["signal_enabled"] is False and t["GBPUSD"]["days_until_recovery"] == 7
+    assert t["EURUSD"]["paused_at"] is None and t["EURUSD"]["days_until_recovery"] is None

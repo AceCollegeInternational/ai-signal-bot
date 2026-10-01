@@ -19,6 +19,8 @@ PAUSE_WIN_RATE = 40.0
 FACTOR_MIN_SAMPLES = 10          # per-side samples needed before a factor can penalise a signal
 FACTOR_PENALTY_POINTS = 5.0
 MIN_HOUR_SAMPLES = 3
+RECOVERY_DAYS = 7
+PAUSE_REASON = "win_rate_below_40pct"
 
 # name -> (SQL boolean over `s` = signals, `t` = trades; python predicate over a signal dict).
 # SQL fragments are module constants — never built from user input.
@@ -89,7 +91,31 @@ def compute_symbol_performance(symbol: str) -> dict:
         t = cur.fetchone()
         wins, losses = int(t["wins"] or 0), int(t["losses"] or 0)
         wr = _win_rate(wins, losses)
-        enabled = 0 if (wr is not None and wins + losses >= MIN_TRADES_FOR_ADAPTATION and wr < PAUSE_WIN_RATE) else 1
+        cur.execute("SELECT signal_enabled, recovered_at FROM performance_by_symbol WHERE symbol = %s FOR UPDATE", (symbol,))
+        prev = cur.fetchone()
+        # Pause decision uses only trades closed since the last recovery, so a recovered
+        # symbol gets a fresh sample instead of being re-paused by its old history.
+        since = prev["recovered_at"] if prev and prev["recovered_at"] else datetime(1970, 1, 1)
+        cur.execute(
+            "SELECT SUM(status='CLOSED_WIN') AS w, SUM(status='CLOSED_LOSS') AS l FROM trades "
+            "WHERE symbol = %s AND status IN ('CLOSED_WIN','CLOSED_LOSS') AND closed_at > %s", (symbol, since))
+        recent = cur.fetchone()
+        rw, rl = int(recent["w"] or 0), int(recent["l"] or 0)
+        rwr = _win_rate(rw, rl)
+        should_pause = rwr is not None and rw + rl >= MIN_TRADES_FOR_ADAPTATION and rwr < PAUSE_WIN_RATE
+        if should_pause and (prev is None or prev["signal_enabled"]):
+            cur.execute(
+                "INSERT INTO performance_by_symbol (symbol, signal_enabled, paused_at, pause_reason) "
+                "VALUES (%s, 0, UTC_TIMESTAMP(), %s) ON DUPLICATE KEY UPDATE signal_enabled = 0, "
+                "paused_at = UTC_TIMESTAMP(), pause_reason = VALUES(pause_reason)", (symbol, PAUSE_REASON))
+            log.warning(f"[ANALYTICS] {symbol} auto-paused: {rwr}% win rate over {rw + rl} trades")
+        elif not should_pause and prev is not None and not prev["signal_enabled"] and rw + rl >= MIN_TRADES_FOR_ADAPTATION:
+            # win rate genuinely recovered on a fresh sample -> un-pause early
+            cur.execute("UPDATE performance_by_symbol SET signal_enabled = 1, paused_at = NULL, pause_reason = NULL, "
+                        "recovered_at = UTC_TIMESTAMP() WHERE symbol = %s", (symbol,))
+        cur.execute("SELECT signal_enabled FROM performance_by_symbol WHERE symbol = %s", (symbol,))
+        row_now = cur.fetchone()
+        enabled = int(row_now["signal_enabled"]) if row_now else 1
         cur.execute(
             "INSERT INTO performance_by_symbol (symbol, total_signals, trades_taken, wins, losses, "
             "win_rate_pct, avg_confluence_score, avg_rr_achieved, total_pips, signal_enabled) "
@@ -97,7 +123,7 @@ def compute_symbol_performance(symbol: str) -> dict:
             "ON DUPLICATE KEY UPDATE total_signals=VALUES(total_signals), trades_taken=VALUES(trades_taken), "
             "wins=VALUES(wins), losses=VALUES(losses), win_rate_pct=VALUES(win_rate_pct), "
             "avg_confluence_score=VALUES(avg_confluence_score), avg_rr_achieved=VALUES(avg_rr_achieved), "
-            "total_pips=VALUES(total_pips), signal_enabled=VALUES(signal_enabled)",
+            "total_pips=VALUES(total_pips)",
             (symbol, sig["n"], t["trades"], wins, losses, wr, _f(sig["avg_score"]),
              _f(t["avg_rr"]), _f(t["pips"]) or 0, enabled))
     log.info(f"[DB] Symbol performance updated: {symbol} trades={t['trades']} win_rate={wr}")
@@ -291,16 +317,38 @@ def generate_performance_report() -> dict:
     }
 
 
-def get_all_thresholds() -> List[Dict[str, Any]]:
-    """Return every symbol's adaptive minimum score and enabled flag."""
+def unpause_symbol(symbol: str) -> bool:
+    """Manually re-enable a symbol; returns False if it has no performance row."""
     with get_db() as cur:
-        cur.execute("SELECT symbol, recommended_min_score, signal_enabled, trades_taken, win_rate_pct, "
-                    "best_hours_utc, worst_hours_utc FROM performance_by_symbol ORDER BY symbol")
+        cur.execute("UPDATE performance_by_symbol SET signal_enabled = 1, paused_at = NULL, pause_reason = NULL, "
+                    "recovered_at = UTC_TIMESTAMP() WHERE symbol = %s", (symbol.upper(),))
+        found = cur.rowcount > 0
+    if found:
+        log.info(f"[ANALYTICS] {symbol.upper()} manually un-paused")
+    return found
+
+
+def get_all_thresholds() -> Dict[str, Dict[str, Any]]:
+    """Return per-symbol adaptive minimum score plus pause status and days until recovery."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with get_db() as cur:
+        cur.execute("SELECT symbol, recommended_min_score, signal_enabled, paused_at, pause_reason, "
+                    "trades_taken, win_rate_pct, best_hours_utc, worst_hours_utc "
+                    "FROM performance_by_symbol ORDER BY symbol")
         rows = cur.fetchall()
-    return [{"symbol": r["symbol"], "recommended_min_score": _f(r["recommended_min_score"]),
-             "signal_enabled": bool(r["signal_enabled"]), "trades_taken": r["trades_taken"],
-             "win_rate_pct": _f(r["win_rate_pct"]), "best_hours_utc": r["best_hours_utc"],
-             "worst_hours_utc": r["worst_hours_utc"]} for r in rows]
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        pa = r["paused_at"]
+        out[r["symbol"]] = {
+            "recommended_min_score": _f(r["recommended_min_score"]),
+            "signal_enabled": bool(r["signal_enabled"]),
+            "paused_at": pa.isoformat() if pa else None,
+            "pause_reason": r["pause_reason"],
+            "days_until_recovery": max(0, RECOVERY_DAYS - (now - pa).days) if pa else None,
+            "trades_taken": r["trades_taken"], "win_rate_pct": _f(r["win_rate_pct"]),
+            "best_hours_utc": r["best_hours_utc"], "worst_hours_utc": r["worst_hours_utc"],
+        }
+    return out
 
 
 # ─── Feedback gate ────────────────────────────────────────────────────────────
@@ -324,7 +372,19 @@ def should_take_signal(signal: dict) -> tuple:
     worst_hours: List[int] = []
     if perf:
         if not perf["signal_enabled"]:
-            return False, "Symbol paused by analytics"
+            paused_at = perf.get("paused_at")
+            days_paused = (datetime.now(timezone.utc).replace(tzinfo=None) - paused_at).days if paused_at else None
+            if days_paused is not None and days_paused >= RECOVERY_DAYS:
+                with get_db() as cur:
+                    cur.execute("UPDATE performance_by_symbol SET signal_enabled = 1, paused_at = NULL, "
+                                "pause_reason = NULL, recovered_at = UTC_TIMESTAMP() WHERE symbol = %s", (symbol,))
+                log.info(f"[ANALYTICS] {symbol} auto-recovered after {days_paused}d cooldown")
+                # fall through to the remaining checks
+            elif days_paused is not None:
+                return False, (f"{symbol} paused ({perf.get('pause_reason')}). "
+                               f"Auto-recovery in {RECOVERY_DAYS - days_paused}d.")
+            else:
+                return False, "Symbol paused by analytics"
         threshold = _f(perf["recommended_min_score"]) or DEFAULT_MIN_SCORE
         worst_hours = [int(h) for h in (perf.get("worst_hours_utc") or "").split(",") if h.strip().isdigit()]
     if score < threshold:

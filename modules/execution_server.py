@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request, Security
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Any, Dict, List, Optional
 import uvicorn
 import time
@@ -266,9 +266,9 @@ class InjectedSignal(BaseModel):
     model_config = ConfigDict(extra="allow")
     symbol: str
     direction: str
-    entry_price: float
-    stop_loss: float
-    take_profit: Optional[float] = None
+    entry_price: float = Field(validation_alias=AliasChoices("entry_price", "entry"))
+    stop_loss: float = Field(validation_alias=AliasChoices("stop_loss", "sl"))
+    take_profit: Optional[float] = Field(None, validation_alias=AliasChoices("take_profit", "tp"))
     confidence: Optional[float] = None
     open_trade: bool = True
 
@@ -359,7 +359,15 @@ def analytics_factors(api_key: str = Security(get_api_key)):
 @app.get("/analytics/thresholds")
 def analytics_thresholds(api_key: str = Security(get_api_key)):
     """Adaptive minimum score and enabled flag for every symbol."""
-    return {"thresholds": analytics_engine.get_all_thresholds()}
+    return analytics_engine.get_all_thresholds()
+
+
+@app.post("/analytics/symbols/{symbol}/unpause")
+def analytics_unpause(symbol: str, api_key: str = Security(get_api_key)):
+    """Manual override: re-enable a paused symbol without waiting for the 7-day recovery."""
+    if not analytics_engine.unpause_symbol(symbol):
+        raise HTTPException(status_code=404, detail="Symbol has no analytics record")
+    return {"symbol": symbol.upper(), "status": "re-enabled", "message": "Manual override applied"}
 
 
 @app.post("/analytics/refresh")

@@ -120,6 +120,9 @@ DDL: List[str] = [
         total_pips              DECIMAL(10,2),
         recommended_min_score   DECIMAL(5,2) DEFAULT 75.0,
         signal_enabled          TINYINT(1)   DEFAULT 1,
+        paused_at               DATETIME DEFAULT NULL,
+        pause_reason            VARCHAR(255) DEFAULT NULL,
+        recovered_at            DATETIME DEFAULT NULL,
         best_hours_utc          VARCHAR(64),
         worst_hours_utc         VARCHAR(64),
         UNIQUE KEY uk_symbol (symbol)
@@ -142,6 +145,9 @@ DDL: List[str] = [
 
 # (table, column, definition) — added when an older deployment lacks the column.
 MIGRATIONS = [
+    ("performance_by_symbol", "paused_at", "DATETIME DEFAULT NULL"),
+    ("performance_by_symbol", "pause_reason", "VARCHAR(255) DEFAULT NULL"),
+    ("performance_by_symbol", "recovered_at", "DATETIME DEFAULT NULL"),
     ("trades", "risk_amount", "DECIMAL(10,2)"),
     ("signals", "gate_rejected", "TINYINT(1) DEFAULT 0"),
     ("signals", "gate_reason", "VARCHAR(255)"),

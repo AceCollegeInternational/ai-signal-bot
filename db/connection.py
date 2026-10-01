@@ -127,7 +127,8 @@ def test_connection() -> bool:
         with get_db() as cur:
             cur.execute("SELECT VERSION() AS v, DATABASE() AS d")
             row = cur.fetchone()
-        msg = f"[DB] Connected: server {row['v']}, database {row['d']}"
+        msg = (f"[DB] Connection OK — host: {os.getenv('DB_HOST')}, db: {row['d']} "
+               f"(server {row['v']})")
         log.info(msg)
         print(msg)
         return True
@@ -139,3 +140,9 @@ def test_connection() -> bool:
         log.critical(f"[DB] Connection test failed: {exc}")
         print(f"[DB] Connection test failed: {exc}")
         return False
+
+
+def create_tables() -> None:
+    """Create all tables on the configured database (alias for db.schema.init_schema)."""
+    from db.schema import init_schema
+    init_schema()
