@@ -9,6 +9,7 @@ pyarrow==20.0.0       # fast parquet caching
 anthropic==0.29.0
 google-generativeai==0.8.3
 groq==1.1.1
+openai>=1.40.0  # used for the DeepSeek (OpenAI-compatible) provider
 
 # ─── Configuration & Environment ─────────────────────────────────────────────
 python-dotenv==1.0.1
