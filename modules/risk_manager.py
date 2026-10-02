@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+from db.repository import record_trade_close, record_trade_open
 from modules.news_filter import NewsFilter
 from modules.ml_validator import MLValidator
 from modules.ai_signal_engine import TradeSignal
@@ -76,6 +77,7 @@ class PositionSizing:
     ml_snapshot: Dict[str, Any] = field(default_factory=dict)
     is_reversal: bool = False
     reversal_from: str = ""
+    signal_id: Optional[int] = None  # DB signals.id that produced this sizing
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -111,6 +113,7 @@ class OpenPosition:
     initial_risk_amount: float = 0.0
     planned_risk_reward: float = 0.0
     trade_id: str = ""
+    signal_id: Optional[int] = None  # DB signals.id that produced this position
 
     def unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L in quote currency."""
@@ -151,6 +154,7 @@ class RiskManager:
         self.ml_dataset_path = os.path.join("logs", "ml_dataset.jsonl")
         self.trade_lifecycle_path = os.path.join("logs", "trade_lifecycle.txt")
         self.open_positions_path = os.path.join("logs", "open_positions.json")
+        self._db_close_ok = False
         self._init_journal()
         self._init_trade_lifecycle_log()
 
@@ -408,6 +412,7 @@ class RiskManager:
             initial_risk_amount=sizing.risk_amount,
             planned_risk_reward=sizing.risk_reward,
             trade_id=f"{sizing.symbol}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+            signal_id=sizing.signal_id,
         )
         self.open_positions[sizing.symbol] = pos
         self.trades_today += 1
@@ -645,6 +650,7 @@ class RiskManager:
                     "initial_risk_amount": pos.initial_risk_amount,
                     "planned_risk_reward": pos.planned_risk_reward,
                     "trade_id": pos.trade_id,
+                    "signal_id": pos.signal_id,
                 }
             with open(self.open_positions_path, "w", encoding="utf-8") as f:
                 json.dump(serialized, f)
@@ -678,6 +684,7 @@ class RiskManager:
                     initial_risk_amount=float(d.get("initial_risk_amount", 0.0)),
                     planned_risk_reward=float(d.get("planned_risk_reward", 0.0)),
                     trade_id=d.get("trade_id", ""),
+                    signal_id=d.get("signal_id"),
                 )
             if positions:
                 log.info(f"Restored {len(positions)} open position(s) from disk: {list(positions.keys())}")
@@ -687,6 +694,12 @@ class RiskManager:
             return {}
 
     def _log_trade_open(self, pos: OpenPosition) -> None:
+        """Record an opened trade in MySQL (legacy lifecycle file only if the DB write fails)."""
+        try:
+            record_trade_open(pos, pos.signal_id)
+            return
+        except Exception as exc:
+            log.critical(f"[DB] Trade open not stored ({exc}) — falling back to lifecycle file")
         self._append_lifecycle_event(
             {
                 "event": "OPEN",
@@ -707,6 +720,9 @@ class RiskManager:
     def _log_trade_close(
         self, pos: OpenPosition, close_price: float, pnl: float, reason: str
     ) -> None:
+        """Record a closed trade in MySQL (legacy lifecycle file only if the DB write fails)."""
+        if self._db_close_ok:
+            return
         self._append_lifecycle_event(
             {
                 "event": "CLOSE",
@@ -726,7 +742,13 @@ class RiskManager:
     def _log_trade(
         self, pos: OpenPosition, close_price: float, pnl: float, reason: str
     ) -> None:
-        """Log trade details to the CSV journal."""
+        """Log a closed trade to MySQL; the legacy CSV journal is the fallback if the DB write fails."""
+        try:
+            record_trade_close(pos, close_price, pnl, reason)
+            self._db_close_ok = True
+        except Exception as exc:
+            self._db_close_ok = False
+            log.critical(f"[DB] Trade close not stored ({exc}) — falling back to CSV journal")
         try:
             duration = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
             # Rough PnL% calculation
@@ -736,24 +758,25 @@ class RiskManager:
                 else 0
             )
 
-            with open(self.journal_path, mode="a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
-                        pos.symbol,
-                        pos.direction,
-                        f"{pos.entry_price:.5f}",
-                        f"{close_price:.5f}",
-                        f"{pos.position_size:.4f}",
-                        f"{pnl:.2f}",
-                        f"{pnl_pct:.2f}%",
-                        reason,
-                        f"{duration:.1f}",
-                        f"{pos.initial_risk_amount:.2f}",
-                        f"{pos.planned_risk_reward:.2f}",
-                    ]
-                )
+            if not self._db_close_ok:
+                with open(self.journal_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z"),
+                            pos.symbol,
+                            pos.direction,
+                            f"{pos.entry_price:.5f}",
+                            f"{close_price:.5f}",
+                            f"{pos.position_size:.4f}",
+                            f"{pnl:.2f}",
+                            f"{pnl_pct:.2f}%",
+                            reason,
+                            f"{duration:.1f}",
+                            f"{pos.initial_risk_amount:.2f}",
+                            f"{pos.planned_risk_reward:.2f}",
+                        ]
+                    )
 
             # Persist ML snapshot for training
             if pos.ml_snapshot:
@@ -771,6 +794,42 @@ class RiskManager:
             log.debug(f"Trade logged to journal and ML dataset: {pos.symbol}")
         except Exception as e:
             log.error(f"Failed to log trade to journal: {e}")
+
+    @staticmethod
+    def _db_period_summary(
+        start_dt: datetime, end_dt: datetime, week_label: str
+    ) -> Optional[Dict[str, Any]]:
+        """Summarise trades closed in [start_dt, end_dt] from MySQL; None if the DB is unavailable."""
+        try:
+            from db.connection import get_db
+
+            utc = timezone.utc
+            start = start_dt.astimezone(utc).replace(tzinfo=None)
+            end = end_dt.astimezone(utc).replace(tzinfo=None)
+            with get_db() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS n, SUM(profit_loss_usd > 0) AS wins, "
+                    "SUM(profit_loss_usd < 0) AS losses, COALESCE(SUM(profit_loss_usd),0) AS profit, "
+                    "COALESCE(SUM(t.risk_amount),0) AS risked "
+                    "FROM trades t WHERE closed_at BETWEEN %s AND %s "
+                    "AND status IN ('CLOSED_WIN','CLOSED_LOSS','CLOSED_BE')",
+                    (start, end),
+                )
+                r = cur.fetchone()
+            total_profit = float(r["profit"] or 0.0)
+            total_risked = float(r["risked"] or 0.0)
+            return {
+                "week_label": week_label,
+                "total_orders": int(r["n"] or 0),
+                "wins": int(r["wins"] or 0),
+                "losses": int(r["losses"] or 0),
+                "total_profit": total_profit,
+                "total_risked": total_risked,
+                "cumulative_rr": (total_profit / total_risked) if total_risked > 0 else 0.0,
+            }
+        except Exception as exc:
+            log.warning(f"[DB] Weekly summary unavailable, using legacy files: {exc}")
+            return None
 
     def get_previous_week_summary(
         self, timezone_str: str = "America/New_York"
@@ -790,6 +849,12 @@ class RiskManager:
         start_prev_week = start_of_this_week - timedelta(days=7)
         end_prev_week = start_of_this_week
         week_label = f"{start_prev_week.date()} to {(end_prev_week - timedelta(seconds=1)).date()}"
+
+        db_summary = self._db_period_summary(
+            start_prev_week, end_prev_week - timedelta(microseconds=1), week_label
+        )
+        if db_summary is not None:
+            return db_summary
 
         if not os.path.exists(self.journal_path):
             return {
@@ -890,6 +955,10 @@ class RiskManager:
             "total_risked": 0.0,
             "cumulative_rr": 0.0,
         }
+
+        db_summary = self._db_period_summary(start_dt, end_dt, week_label)
+        if db_summary is not None:
+            return db_summary
 
         if not os.path.exists(self.trade_lifecycle_path):
             return default_summary

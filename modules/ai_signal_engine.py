@@ -14,6 +14,8 @@ Workflow:
 
 import json
 import os
+import re
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type
@@ -23,6 +25,91 @@ import pandas as pd
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# A hung provider must fail fast and fall through to the next one.
+PROVIDER_TIMEOUT_S = float(os.getenv("AI_PROVIDER_TIMEOUT", "30"))
+# Hard wall-clock cap enforced by the engine itself, in case an SDK timeout does not cover a stall (e.g. DNS).
+HARD_DEADLINE_S = PROVIDER_TIMEOUT_S + 1.0
+
+
+REQUIRED_SIGNAL_KEYS = ("signal", "confidence", "entry_price", "stop_loss", "take_profit_1")
+
+
+def _close_truncated_json(chunk: str) -> str:
+    """Close a JSON fragment cut off mid-reply: end an open string, drop a dangling key/comma, add closers."""
+    stack: List[str] = []
+    in_str = esc = False
+    for ch in chunk:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+    if in_str:
+        if esc:  # cut right after a backslash — drop it so the closing quote is not escaped
+            chunk = chunk[:-1]
+        chunk += '"'
+    chunk = chunk.rstrip()
+    # a number at the very end may itself be cut short (1.10 of 1.10893) — never trust it
+    chunk = re.sub(r',?\s*"[^"\\]*"\s*:\s*-?[\d.]+(?:[eE][+-]?\d*)?$', "", chunk) if not in_str else chunk
+    # drop a trailing comma or a key with no value yet ("key": / "key")
+    chunk = re.sub(r',\s*$', "", chunk)
+    chunk = re.sub(r',?\s*"[^"\\]*"\s*:\s*$', "", chunk)
+    return chunk + "".join(reversed(stack))
+
+
+def extract_json_ex(text: str) -> tuple:
+    """Return (dict, recovered) for the outermost JSON object in an LLM reply; recovered=True if it was truncated."""
+    if not text:
+        raise ValueError("Empty response")
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = text.replace("```", "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1:
+        raise ValueError(f"No JSON object found in response: {text[:200]}")
+    if end > start:
+        try:
+            return json.loads(text[start:end + 1]), False
+        except json.JSONDecodeError:
+            pass  # the last '}' may belong to a nested object of a truncated reply — try recovery
+    # Response truncated before the closing brace — close what is open and retry
+    try:
+        return json.loads(_close_truncated_json(text[start:])), True
+    except json.JSONDecodeError:
+        raise ValueError(f"Truncated JSON, recovery failed: {text[:200]}")
+
+
+def extract_json(text: str) -> dict:
+    """Extract the outermost JSON object from an LLM reply (handles fences, prose and truncation)."""
+    return extract_json_ex(text)[0]
+
+
+def call_with_deadline(fn, deadline_s: float):
+    """Run fn() in a daemon thread and raise TimeoutError if it has not finished within deadline_s."""
+    box: Dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # propagate any provider error to the caller
+            box["error"] = exc
+
+    t = threading.Thread(target=runner, daemon=True, name="llm-call")
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        raise TimeoutError(f"no response within {deadline_s:g}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 # ─── System prompt for all providers ───────────────────
 SYSTEM_PROMPT = """You are an expert quantitative technical analyst and algorithmic trader with 20+ years of experience. 
@@ -85,6 +172,8 @@ class TradeSignal:
     symbol: str = ""
     timeframe: str = ""
     provider: str = ""
+    llm_provider: Optional[str] = None   # provider that produced this signal (gemini/groq/deepseek/claude)
+    llm_model: Optional[str] = None      # model name that provider used
     raw_response: Dict[str, Any] = field(default_factory=dict)
 
     def is_actionable(self, min_confidence: float = 75.0, min_rr: float = 1.5) -> bool:
@@ -102,16 +191,26 @@ class TradeSignal:
 
 
 class AIProvider(ABC):
+    NAME = ""
+    model_name: Optional[str] = None
+
     @abstractmethod
     def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         pass
 
+    def annotate(self, signal: Any) -> None:
+        """Stamp a signal this provider produced with the provider name and the model it used."""
+        signal.llm_provider = self.NAME or None
+        signal.llm_model = self.model_name
+
 
 class AnthropicProvider(AIProvider):
+    NAME = "claude"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         import anthropic
 
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -128,7 +227,9 @@ class AnthropicProvider(AIProvider):
 
 
 class GeminiProvider(AIProvider):
+    NAME = "gemini"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
@@ -152,17 +253,23 @@ class GeminiProvider(AIProvider):
     def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         if not self.has_sys_prompt:
             combined_prompt = f"{system_prompt}\n\nUser context:\n{user_prompt}"
-            response = self.model.generate_content(combined_prompt)
+            response = self.model.generate_content(
+                combined_prompt, request_options={"timeout": PROVIDER_TIMEOUT_S}
+            )
         else:
-            response = self.model.generate_content(user_prompt)
+            response = self.model.generate_content(
+                user_prompt, request_options={"timeout": PROVIDER_TIMEOUT_S}
+            )
         return response.text
 
 
 class GroqProvider(AIProvider):
+    NAME = "groq"
     def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
         from groq import Groq
 
-        self.client = Groq(api_key=api_key)
+        self.client = Groq(api_key=api_key, timeout=PROVIDER_TIMEOUT_S, max_retries=0)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -180,6 +287,45 @@ class GroqProvider(AIProvider):
         return chat_completion.choices[0].message.content
 
 
+class DeepSeekProvider(AIProvider):
+    NAME = "deepseek"
+    """DeepSeek via its OpenAI-compatible API."""
+
+    BASE_URL = "https://api.deepseek.com"
+
+    def __init__(self, api_key: str, model: str, max_tokens: int, temperature: float):
+        self.model_name = model
+        from openai import OpenAI
+
+        self.client = OpenAI(
+            api_key=api_key, base_url=self.BASE_URL, timeout=PROVIDER_TIMEOUT_S, max_retries=0
+        )
+        self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+
+    def generate_content(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+        )
+        return response.choices[0].message.content
+
+
+# Fallback order per primary: primary -> secondary -> tertiary (claude stays last, as before).
+PROVIDER_CHAINS: Dict[str, List[str]] = {
+    "deepseek": ["deepseek", "groq", "gemini", "claude"],
+    "groq": ["groq", "deepseek", "gemini", "claude"],
+    "gemini": ["gemini", "deepseek", "groq", "claude"],
+    "claude": ["claude", "groq", "deepseek", "gemini"],
+}
+
+
 # ─── Main Engine ──────────────────────────────────────────────────────────────
 
 
@@ -192,7 +338,7 @@ class AISignalEngine:
         self.providers: Dict[str, AIProvider] = {}
         self._init_providers(ai_cfg)
 
-        self.primary = ai_cfg.get("primary_provider", "gemini")
+        self.primary = (os.getenv("AI_PRIMARY") or ai_cfg.get("primary_provider", "gemini")).strip().lower()
         self.fallback_enabled = ai_cfg.get("fallback_enabled", True)
         self._no_provider_logged = False
 
@@ -200,7 +346,10 @@ class AISignalEngine:
         sig_cfg = config.get("signals", {})
         self.min_confidence = sig_cfg.get("min_confidence", 75.0)
 
-        log.info(f"AISignalEngine init with primary={self.primary}")
+        chain = self.provider_order()
+        log.info(
+            f"[AI] Signal engine init — primary={self.primary} fallback={chain[1:] if chain and chain[0] == self.primary else chain}"
+        )
 
     def _init_providers(self, ai_cfg: Dict[str, Any]):
         # Gemini
@@ -209,8 +358,8 @@ class AISignalEngine:
             cfg = ai_cfg.get("gemini", {})
             self.providers["gemini"] = GeminiProvider(
                 gem_key,
-                cfg.get("model", "gemini-2.0-flash"),
-                cfg.get("max_tokens", 1000),
+                os.getenv("GEMINI_MODEL") or cfg.get("model", "gemini-2.5-flash"),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
 
@@ -220,10 +369,23 @@ class AISignalEngine:
             cfg = ai_cfg.get("groq", {})
             self.providers["groq"] = GroqProvider(
                 groq_key,
-                cfg.get("model", "llama-3.3-70b-versatile"),
-                cfg.get("max_tokens", 1000),
+                os.getenv("GROQ_MODEL") or cfg.get("model", "llama3-70b-8192"),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
+
+        # DeepSeek (OpenAI-compatible)
+        ds_key = os.getenv("DEEPSEEK_API_KEY")
+        if ds_key:
+            cfg = ai_cfg.get("deepseek", {})
+            self.providers["deepseek"] = DeepSeekProvider(
+                ds_key,
+                os.getenv("DEEPSEEK_MODEL") or cfg.get("model", "deepseek-chat"),
+                cfg.get("max_tokens", 2000),
+                cfg.get("temperature", 0.1),
+            )
+        else:
+            log.warning("[AI] DeepSeek provider not configured — DEEPSEEK_API_KEY missing.")
 
         # Claude (Legacy support / Optional)
         ant_key = os.getenv("ANTHROPIC_API_KEY")
@@ -232,7 +394,7 @@ class AISignalEngine:
             self.providers["claude"] = AnthropicProvider(
                 ant_key,
                 cfg.get("model", "claude-3-5-sonnet-20240620"),
-                cfg.get("max_tokens", 1000),
+                cfg.get("max_tokens", 2000),
                 cfg.get("temperature", 0.1),
             )
 
@@ -277,17 +439,18 @@ class AISignalEngine:
             "higher_timeframe_context": htf_context or {},
         }
 
+    def provider_order(self) -> List[str]:
+        """Return configured providers in call order: primary, then the fallback chain."""
+        chain = PROVIDER_CHAINS.get(self.primary, [self.primary] + [p for p in PROVIDER_CHAINS["groq"] if p != self.primary])
+        ordered = [p for p in chain if p in self.providers]
+        if not self.fallback_enabled:
+            ordered = ordered[:1] if ordered and ordered[0] == self.primary else []
+        return ordered
+
     def get_signal(
         self, payload: Dict[str, Any], symbol: str = "", timeframe: str = ""
     ) -> TradeSignal:
-        ordered_providers = []
-        if self.primary in self.providers:
-            ordered_providers.append(self.primary)
-
-        if self.fallback_enabled:
-            for p in ["gemini", "groq", "claude"]:
-                if p in self.providers and p not in ordered_providers:
-                    ordered_providers.append(p)
+        ordered_providers = self.provider_order()
 
         if not ordered_providers:
             if not self._no_provider_logged:
@@ -301,13 +464,17 @@ class AISignalEngine:
             try:
                 log.info(f"Requesting signal via {provider_name}...")
                 provider = self.providers[provider_name]
-                raw_text = provider.generate_content(SYSTEM_PROMPT, payload_json)
+                raw_text = call_with_deadline(
+                    lambda: provider.generate_content(SYSTEM_PROMPT, payload_json),
+                    HARD_DEADLINE_S,
+                )
 
                 if not raw_text:
                     continue
 
                 signal = self._parse_response(raw_text, symbol, timeframe)
                 signal.provider = provider_name
+                provider.annotate(signal)  # llm_provider / llm_model, from the provider's own name and model
                 return signal
 
             except Exception as e:
@@ -331,14 +498,14 @@ class AISignalEngine:
         return self.get_signal(payload, symbol, timeframe)
 
     def _parse_response(self, text: str, symbol: str, timeframe: str) -> TradeSignal:
-        # Simple extraction for JSON in markdown fences
-        if "```" in text:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            text = text[start:end]
-
+        raw = text or ""
         try:
-            data = json.loads(text)
+            data, recovered = extract_json_ex(raw)
+            if recovered:
+                missing = [k for k in REQUIRED_SIGNAL_KEYS if k not in data]
+                if missing:  # never trade on a truncated reply that lost its price levels
+                    raise ValueError(f"Truncated response missing required fields: {missing}")
+                log.warning("[AI] Response was truncated; recovered by auto-closing the JSON.")
             return TradeSignal(
                 signal=data.get("signal", "HOLD").upper(),
                 confidence=float(data.get("confidence", 0)),
@@ -355,6 +522,10 @@ class AISignalEngine:
                 timeframe=timeframe,
                 raw_response=data,
             )
+        except (json.JSONDecodeError, ValueError) as e:
+            log.debug(f"[AI] Raw response that failed parsing: {raw[:300]}")
+            log.error(f"Parse error: {e}")
+            return self._hold_signal(symbol, timeframe, f"Parse failed: {e}")
         except Exception as e:
             log.error(f"Parse error: {e}")
             return self._hold_signal(symbol, timeframe, f"Parse failed: {e}")

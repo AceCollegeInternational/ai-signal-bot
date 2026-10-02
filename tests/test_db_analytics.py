@@ -1,0 +1,352 @@
+"""Integration tests for the MySQL layer, analytics engine, gate and API.
+
+Run only against a disposable database: set FXGURU_TEST_DB=1 plus DB_* env vars.
+The tests TRUNCATE the signal/trade/analytics tables, so DB_NAME must contain "test".
+"""
+
+import os
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("FXGURU_TEST_DB") != "1", reason="set FXGURU_TEST_DB=1 with a disposable DB_* to run"
+)
+
+if os.getenv("FXGURU_TEST_DB") == "1" and "test" not in os.getenv("DB_NAME", "").lower():
+    raise RuntimeError("Refusing to run destructive tests: DB_NAME must contain 'test'")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from analytics import engine  # noqa: E402
+from db import repository  # noqa: E402
+from db.connection import get_db  # noqa: E402
+from db.schema import init_schema  # noqa: E402
+from modules.execution_server import app  # noqa: E402
+
+H = {"X-API-KEY": os.getenv("EXECUTION_BRIDGE_KEY", "default_secret_key")}
+
+
+@pytest.fixture(autouse=True)
+def clean_db():
+    """Start every test from empty tables."""
+    init_schema()
+    with get_db() as cur:
+        cur.execute("SET FOREIGN_KEY_CHECKS=0")
+        for t in ("trades", "signals", "performance_daily", "performance_by_symbol", "factor_effectiveness", "app_settings"):
+            cur.execute(f"TRUNCATE TABLE {t}")
+        cur.execute("SET FOREIGN_KEY_CHECKS=1")
+
+
+def _seed(symbol, n, win_when_sweep=True, score=85.0, hour=9):
+    """Insert n closed trades: sweep trades win, non-sweep trades lose."""
+    for i in range(n):
+        sweep = i % 2 == 0
+        sid, tid = repository.insert_signal_and_trade(
+            {"symbol": symbol, "direction": "LONG", "entry_price": 1.1, "stop_loss": 1.095,
+             "take_profit": 1.11, "confidence": score, "liquidity_sweep": int(sweep)}, {}, source="LLM")
+        win = sweep if win_when_sweep else not sweep
+        with get_db() as cur:
+            cur.execute("UPDATE trades SET opened_at = CONCAT(DATE(opened_at), ' ', %s, ':00:00') WHERE id=%s", (f"{hour:02d}", tid))
+        repository.update_trade_outcome(tid, 1.105 if win else 1.095, "TP1" if win else "SL", None, 50 if win else -50)
+
+
+def test_requires_auth():
+    c = TestClient(app)
+    assert c.get("/trades").status_code == 403
+    assert c.get("/analytics/performance").status_code == 403
+
+
+def test_inject_list_and_outcome():
+    with TestClient(app) as c:
+        r = c.post("/debug/signal/inject", headers=H, json={
+            "symbol": "EURUSD", "direction": "BUY", "entry_price": 1.1, "stop_loss": 1.095,
+            "take_profit": 1.11, "confidence": 88})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["signal_id"] and body["trade_id"]
+        sigs = c.get("/signals?symbol=EURUSD&tier=TIER_2", headers=H).json()
+        assert sigs["total"] == 1 and sigs["items"][0]["signal_source"] == "INJECTED"
+        out = c.put(f"/trades/{body['trade_id']}/outcome", headers=H,
+                    json={"exit_price": 1.11, "exit_reason": "TP1", "profit_loss_usd": 100})
+        assert out.status_code == 200 and out.json()["status"] == "CLOSED_WIN"
+        assert out.json()["pips_gained"] == 100.0 and out.json()["rr_achieved"] == 2.0
+        assert c.put("/trades/99999/outcome", headers=H, json={"exit_price": 1, "exit_reason": "SL"}).status_code == 404
+        tr = c.get("/trades?status=closed_win&date_from=2000-01-01", headers=H).json()
+        assert tr["total"] == 1
+        assert c.get("/trades?date_from=bogus", headers=H).status_code == 422
+        # outcome triggered an analytics refresh for the symbol
+        assert c.get("/analytics/performance/EURUSD", headers=H).json()["wins"] == 1
+
+
+def test_rollback_on_multi_table_failure():
+    with pytest.raises(Exception):
+        repository.insert_signal_and_trade(
+            {"symbol": "EURUSD", "direction": "LONG", "entry_price": 1.1, "stop_loss": 1.0}, {"status": "BOGUS"})
+    assert repository.list_signals()["total"] == 0  # signal insert rolled back with the failed trade
+
+
+def test_factor_effectiveness_and_report():
+    _seed("EURUSD", 20)
+    with TestClient(app) as c:
+        factors = c.get("/analytics/factors", headers=H).json()["factors"]
+        sweep = next(f for f in factors if f["factor_name"] == "liquidity_sweep")
+        assert sweep["win_rate_when_present"] == 100.0 and sweep["win_rate_when_absent"] == 0.0
+        assert factors[0]["weight_adjustment"] == 1.0
+        rep = c.get("/analytics/performance", headers=H).json()
+        assert rep["overall"]["win_rate_pct"] == 50.0 and rep["best_symbol"] == "EURUSD"
+        assert rep["most_reliable_factor"]["factor_name"] == "liquidity_sweep"
+        with get_db() as cur:
+            cur.execute("SELECT trades_taken FROM performance_daily")
+            assert cur.fetchone()["trades_taken"] == 20
+
+
+def test_adaptive_threshold_default_and_learned():
+    _seed("GBPUSD", 5)
+    assert engine.compute_adaptive_score_threshold("GBPUSD") == 75.0  # <20 trades
+    _seed("USDJPY", 10, score=70.0)
+    _seed("USDJPY", 10, score=90.0, win_when_sweep=True)
+    with get_db() as cur:  # make all low-score trades lose, high-score trades win
+        cur.execute("UPDATE trades t JOIN signals s ON s.id=t.signal_id SET t.status="
+                    "IF(s.confluence_score>=90,'CLOSED_WIN','CLOSED_LOSS') WHERE t.symbol='USDJPY'")
+    assert engine.compute_adaptive_score_threshold("USDJPY") == 90.0
+
+
+def test_gate():
+    _seed("EURUSD", 20, win_when_sweep=False)  # 50% overall -> enabled
+    assert engine.should_take_signal({"symbol": "EURUSD", "confidence": 60})[0] is False
+    ok, why = engine.should_take_signal({"symbol": "EURUSD", "confidence": 80, "hour_utc": 3})
+    assert ok and "Passed" in why
+    # unknown symbol -> defaults
+    assert engine.should_take_signal({"symbol": "AUDUSD", "confidence": 74.9})[0] is False
+    assert engine.should_take_signal({"symbol": "AUDUSD", "confidence": 75})[0] is True
+    # pause: >=20 trades, win rate < 40
+    with get_db() as cur:
+        cur.execute("UPDATE trades SET status='CLOSED_LOSS' WHERE symbol='EURUSD'")
+    engine.compute_symbol_performance("EURUSD")
+    ok, why = engine.should_take_signal({"symbol": "EURUSD", "confidence": 99})
+    assert ok is False and why.startswith("EURUSD paused (win_rate_below_40pct). Auto-recovery in")
+
+
+def test_gate_session_and_factor_penalty():
+    _seed("EURUSD", 20, hour=3)
+    _seed("EURUSD", 20, hour=9, win_when_sweep=False)
+    engine.compute_optimal_session_times("EURUSD")
+    times = engine.compute_optimal_session_times("EURUSD")
+    assert set(times["best_hours_utc"]) | set(times["worst_hours_utc"]) <= {3, 9}
+    with get_db() as cur:
+        cur.execute("UPDATE performance_by_symbol SET worst_hours_utc='4', recommended_min_score=75 WHERE symbol='EURUSD'")
+    ok, why = engine.should_take_signal({"symbol": "EURUSD", "confidence": 90, "hour_utc": 4})
+    assert not ok and "Unfavourable session" in why
+    # weak factor (sweep wins 50% overall here, so force a weak row) penalises a borderline score
+    with get_db() as cur:
+        cur.execute("INSERT INTO factor_effectiveness (factor_name, present_in_wins, present_in_losses, win_rate_when_present) "
+                    "VALUES ('liquidity_sweep', 2, 18, 10) ON DUPLICATE KEY UPDATE win_rate_when_present=10, present_in_losses=18")
+    ok, why = engine.should_take_signal({"symbol": "EURUSD", "confidence": 77, "liquidity_sweep": 1, "hour_utc": 5})
+    assert not ok and "weak factors" in why
+
+
+def test_gate_rejected_signal_is_logged_not_executed():
+    sid = repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "confidence": 60,
+                                    "entry_price": 1.1, "stop_loss": 1.09}, "LLM", True, "Score below adaptive threshold")
+    row = repository.list_signals(gate_rejected=True)["items"][0]
+    assert row["id"] == sid and row["gate_rejected"] == 1
+
+
+def test_db_unavailable_returns_503(monkeypatch):
+    from db import connection
+    connection.reset_pool()
+    monkeypatch.setenv("DB_PORT", "1")  # nothing listens here
+    monkeypatch.setenv("DB_CONNECT_TIMEOUT", "1")
+    try:
+        c = TestClient(app, raise_server_exceptions=False)
+        assert c.get("/trades", headers=H).status_code == 503
+        assert engine.should_take_signal({"symbol": "EURUSD", "confidence": 80})[0] is True  # fail-open
+        # signal insert degrades to the file fallback
+        repository.FALLBACK_PATH, old = os.path.join(os.getenv("TMPDIR", "/tmp"), "fb_test.jsonl"), repository.FALLBACK_PATH
+        try:
+            assert repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "entry_price": 1}) is None
+            assert os.path.exists(repository.FALLBACK_PATH)
+        finally:
+            os.path.exists(repository.FALLBACK_PATH) and os.remove(repository.FALLBACK_PATH)
+            repository.FALLBACK_PATH = old
+    finally:
+        monkeypatch.undo()
+        connection.reset_pool()
+
+
+def _seed_results(symbol, wins, losses):
+    """Insert closed trades with an exact win/loss split."""
+    for i in range(wins + losses):
+        win = i < wins
+        _, tid = repository.insert_signal_and_trade(
+            {"symbol": symbol, "direction": "LONG", "entry_price": 1.3, "stop_loss": 1.295, "confidence": 85}, {})
+        repository.update_trade_outcome(tid, 1.305 if win else 1.295, "TP1" if win else "SL", None, 50 if win else -50)
+
+
+def _row(symbol):
+    with get_db() as cur:
+        cur.execute("SELECT * FROM performance_by_symbol WHERE symbol=%s", (symbol,))
+        return cur.fetchone()
+
+
+def test_no_auto_pause_below_20_trades():
+    _seed_results("GBPUSD", 0, 15)
+    engine.compute_symbol_performance("GBPUSD")
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 1 and r["paused_at"] is None
+
+
+def test_auto_pause_at_20_trades_low_win_rate():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 0 and r["paused_at"] is not None and r["pause_reason"] == "win_rate_below_40pct"
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95})
+    assert not ok and "Auto-recovery in 7d" in why
+
+
+def test_seven_day_recovery_and_no_instant_repause():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with get_db() as cur:
+        cur.execute("UPDATE performance_by_symbol SET paused_at = UTC_TIMESTAMP() - INTERVAL 8 DAY WHERE symbol='GBPUSD'")
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95, "hour_utc": 3})
+    assert ok is True, why
+    r = _row("GBPUSD")
+    assert r["signal_enabled"] == 1 and r["paused_at"] is None and r["pause_reason"] is None
+    # the old bad history must not re-pause it on the next analytics run
+    engine.compute_symbol_performance("GBPUSD")
+    assert _row("GBPUSD")["signal_enabled"] == 1
+
+
+def test_still_paused_before_seven_days():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with get_db() as cur:
+        cur.execute("UPDATE performance_by_symbol SET paused_at = UTC_TIMESTAMP() - INTERVAL 2 DAY WHERE symbol='GBPUSD'")
+    ok, why = engine.should_take_signal({"symbol": "GBPUSD", "confidence": 95})
+    assert not ok and "Auto-recovery in 5d" in why
+
+
+def test_manual_unpause_endpoint():
+    _seed_results("GBPUSD", 6, 14)
+    engine.compute_symbol_performance("GBPUSD")
+    with TestClient(app) as c:
+        r = c.post("/analytics/symbols/GBPUSD/unpause", headers=H)
+        assert r.status_code == 200 and r.json() == {
+            "symbol": "GBPUSD", "status": "re-enabled", "message": "Manual override applied"}
+        assert _row("GBPUSD")["signal_enabled"] == 1
+        engine.compute_symbol_performance("GBPUSD")  # must not instantly re-pause
+        assert _row("GBPUSD")["signal_enabled"] == 1
+        assert c.post("/analytics/symbols/NOPE/unpause", headers=H).status_code == 404
+        assert c.post("/analytics/symbols/GBPUSD/unpause").status_code == 403
+
+
+def test_thresholds_include_pause_fields():
+    _seed_results("GBPUSD", 6, 14)
+    _seed_results("EURUSD", 10, 10)
+    engine.compute_symbol_performance("GBPUSD")
+    engine.compute_symbol_performance("EURUSD")
+    with TestClient(app) as c:
+        t = c.get("/analytics/thresholds", headers=H).json()
+    assert {"paused_at", "pause_reason", "days_until_recovery", "recommended_min_score", "signal_enabled"} <= set(t["GBPUSD"])
+    assert t["GBPUSD"]["signal_enabled"] is False and t["GBPUSD"]["days_until_recovery"] == 7
+    assert t["EURUSD"]["paused_at"] is None and t["EURUSD"]["days_until_recovery"] is None
+
+
+def test_health_db_connected():
+    from db.startup import startup_db
+    assert startup_db() is True
+    r = TestClient(app).get("/health")
+    body = r.json()
+    assert r.status_code == 200 and body["status"] == "ok" and body["db"] == "connected"
+    assert body["migration"] == "completed" and body["timestamp"].endswith("Z")
+
+
+def test_health_db_unreachable(monkeypatch):
+    from db import connection
+    connection.reset_pool()
+    monkeypatch.setenv("DB_PORT", "1")
+    monkeypatch.setenv("DB_CONNECT_TIMEOUT", "1")
+    try:
+        r = TestClient(app).get("/health")
+        assert r.status_code == 200
+        assert r.json()["status"] == "degraded" and r.json()["db"] == "unreachable" and r.json()["migration"] == "unknown"
+        from db.startup import startup_db
+        assert startup_db() is False  # degrades, does not raise
+    finally:
+        monkeypatch.undo()
+        connection.reset_pool()
+
+
+def test_admin_migrate_already_done_then_force(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # empty ./logs -> nothing to migrate
+    c = TestClient(app)
+    assert c.post("/admin/db-migrate").status_code == 403
+    first = c.post("/admin/db-migrate", headers=H).json()
+    assert first["status"] == "complete" and first["errors"] == []
+    second = c.post("/admin/db-migrate", headers=H).json()
+    assert second == {"status": "already_done",
+                      "message": "Migration already completed. Pass ?force=true to re-run."}
+    forced = c.post("/admin/db-migrate?force=true", headers=H).json()
+    assert forced["status"] == "complete" and set(forced) == {
+        "status", "records_found", "records_inserted", "records_skipped", "errors"}
+
+
+def test_startup_migrates_legacy_files_once(tmp_path, monkeypatch):
+    import json
+    from db.startup import startup_db
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "trade_lifecycle.txt").write_text(json.dumps(
+        {"event": "OPEN", "timestamp_utc": "2026-09-01T08:00:00+00:00", "trade_id": "EURUSD-1", "symbol": "EURUSD",
+         "direction": "long", "entry_price": 1.1, "size": 10000, "stop_loss": 1.09, "take_profit_1": 1.12}) + "\n")
+    monkeypatch.chdir(tmp_path)
+    startup_db()
+    assert repository.list_trades()["total"] == 1
+    startup_db()  # flag set -> skipped, still one row
+    assert repository.list_trades()["total"] == 1
+
+
+def _prov_signal(provider, model, score, win=None):
+    """Insert a signal (+ closed trade when win is True/False) attributed to an LLM provider."""
+    sid = repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "confidence": score, "entry_price": 1.1,
+                                    "stop_loss": 1.09, "llm_provider": provider, "llm_model": model})
+    if win is not None:
+        with get_db() as cur:
+            cur.execute("INSERT INTO trades (signal_id, symbol, direction, entry_actual, sl_actual) "
+                        "VALUES (%s,'EURUSD','LONG',1.1,1.09)", (sid,))
+            tid = cur.lastrowid
+        repository.update_trade_outcome(tid, 1.11 if win else 1.09, "TP1" if win else "SL", None, 10 if win else -10)
+    return sid
+
+
+def test_provider_and_model_stored_and_null_ok():
+    sid = _prov_signal("deepseek", "deepseek-chat", 80)
+    none_id = repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "entry_price": 1.1, "stop_loss": 1.09})
+    rows = {r["id"]: r for r in repository.list_signals()["items"]}
+    assert (rows[sid]["llm_provider"], rows[sid]["llm_model"]) == ("deepseek", "deepseek-chat")
+    assert rows[none_id]["llm_provider"] is None and rows[none_id]["llm_model"] is None  # NULL, no error
+
+
+def test_schema_has_llm_columns():
+    with get_db() as cur:
+        cur.execute("SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH AS n FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='signals' AND COLUMN_NAME IN ('llm_provider','llm_model')")
+        cols = {r["COLUMN_NAME"]: r["n"] for r in cur.fetchall()}
+    assert cols == {"llm_provider": 20, "llm_model": 64}
+
+
+def test_providers_endpoint():
+    for _ in range(3):
+        _prov_signal("gemini", "gemini-2.5-flash", 70, win=True)
+    _prov_signal("gemini", "gemini-2.5-flash", 80, win=False)
+    _prov_signal("groq", "llama3-70b-8192", 60)  # no closed trades
+    repository.insert_signal({"symbol": "EURUSD", "signal": "BUY", "entry_price": 1.1, "stop_loss": 1.09})  # unattributed
+    with TestClient(app) as c:
+        assert c.get("/analytics/providers").status_code == 403
+        r = c.get("/analytics/providers", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"gemini", "groq"}
+    assert body["gemini"] == {"signals": 4, "win_rate": 75.0, "avg_confidence": 72.5, "trades_closed": 4}
+    assert body["groq"]["signals"] == 1 and body["groq"]["win_rate"] is None and body["groq"]["avg_confidence"] == 60.0

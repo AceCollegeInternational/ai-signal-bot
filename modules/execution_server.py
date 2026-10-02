@@ -18,21 +18,72 @@ Endpoints:
     GET  /health          — Health check
 """
 
-from fastapi import FastAPI, HTTPException, Security
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from typing import Any, Dict, List, Optional
 import uvicorn
 import time
 import os
 from datetime import datetime, timezone
 from modules.market_data_store import market_data_store
+from analytics import engine as analytics_engine
+from db import repository
+from db.connection import DatabaseUnavailableError, db_configured, db_get_one
+from db.startup import migration_done, run_and_record_migration, startup_db
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+
+def _scheduled(fn, name: str):
+    """Wrap an analytics job so a failure is logged instead of killing the scheduler thread."""
+    def runner() -> None:
+        try:
+            fn()
+            log.info(f"[DB] Scheduled job {name} finished")
+        except Exception as exc:
+            log.error(f"[DB] Scheduled job {name} failed: {exc}")
+    return runner
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialise the DB schema and run the analytics scheduler for the app's lifetime."""
+    scheduler = None
+    if db_configured():
+        await asyncio.to_thread(startup_db)  # never raises; logs CRITICAL and degrades if DB is down
+        from apscheduler.schedulers.background import BackgroundScheduler
+        scheduler = BackgroundScheduler(timezone="UTC")
+        scheduler.add_job(_scheduled(analytics_engine.generate_performance_report, "daily_report"),
+                          "cron", hour=0, minute=5)
+        scheduler.add_job(_scheduled(analytics_engine.compute_factor_effectiveness, "factor_refresh"),
+                          "interval", hours=6)
+        scheduler.start()
+        log.info("[DB] Analytics scheduler started")
+    else:
+        log.critical("[DB] DB_* environment variables not set — running with file-logging fallback")
+    yield
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
+
 
 app = FastAPI(
     title="Trading Bot Execution Bridge",
     description="API for trading signal distribution and bot monitoring",
     version="2.0.0",
+    lifespan=lifespan,
 )
+
+
+@app.exception_handler(DatabaseUnavailableError)
+async def database_unavailable_handler(_request: Request, exc: DatabaseUnavailableError):
+    """Return HTTP 503 (instead of crashing) when MySQL is unreachable."""
+    return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
 
 # ─── Security ────────────────────────────────────────────────────────────────
 API_KEY = os.getenv("EXECUTION_BRIDGE_KEY", "default_secret_key")
@@ -204,6 +255,143 @@ async def post_position_event(event: PositionEvent, api_key: str = Security(get_
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DATABASE-BACKED ENDPOINTS (API key required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class InjectedSignal(BaseModel):
+    """Payload for POST /debug/signal/inject (extra fields are stored as context)."""
+    model_config = ConfigDict(extra="allow")
+    symbol: str
+    direction: str
+    entry_price: float = Field(validation_alias=AliasChoices("entry_price", "entry"))
+    stop_loss: float = Field(validation_alias=AliasChoices("stop_loss", "sl"))
+    take_profit: Optional[float] = Field(None, validation_alias=AliasChoices("take_profit", "tp"))
+    confidence: Optional[float] = None
+    open_trade: bool = True
+
+
+class TradeOutcome(BaseModel):
+    """Payload for PUT /trades/{id}/outcome."""
+    exit_price: float
+    exit_reason: str
+    pips_gained: Optional[float] = None
+    profit_loss_usd: Optional[float] = None
+
+
+def _valid_date(value: Optional[str], name: str) -> Optional[str]:
+    """Validate a YYYY-MM-DD query parameter."""
+    if value is None:
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"{name} must be YYYY-MM-DD")
+    return value
+
+
+@app.post("/debug/signal/inject")
+def inject_signal(payload: InjectedSignal, api_key: str = Security(get_api_key)):
+    """Inject a test signal (and optionally an OPEN trade) into the DB in one transaction."""
+    data = payload.model_dump()
+    if not repository.normalize_direction(data["direction"]):
+        raise HTTPException(status_code=422, detail="direction must be LONG/SHORT/BUY/SELL")
+    open_trade = data.pop("open_trade")
+    if open_trade:
+        signal_id, trade_id = repository.insert_signal_and_trade(data, {}, source="INJECTED")
+    else:
+        signal_id, trade_id = repository.insert_signal(data, source="INJECTED"), None
+    return {"status": "injected", "signal_id": signal_id, "trade_id": trade_id}
+
+
+@app.get("/signals")
+def list_signals_endpoint(
+    page: int = 1, page_size: int = Query(50, le=200), tier: Optional[str] = None,
+    symbol: Optional[str] = None, gate_rejected: Optional[bool] = None,
+    api_key: str = Security(get_api_key),
+):
+    """Paginated signal list, filterable by tier/symbol/gate_rejected."""
+    return repository.list_signals(page, page_size, tier, symbol, gate_rejected)
+
+
+@app.get("/trades")
+def list_trades_endpoint(
+    page: int = 1, page_size: int = Query(50, le=200), symbol: Optional[str] = None,
+    status: Optional[str] = None, date_from: Optional[str] = None, date_to: Optional[str] = None,
+    api_key: str = Security(get_api_key),
+):
+    """Paginated trade list, filterable by symbol/status/opened date range (YYYY-MM-DD)."""
+    return repository.list_trades(page, page_size, symbol, status,
+                                  _valid_date(date_from, "date_from"), _valid_date(date_to, "date_to"))
+
+
+@app.put("/trades/{trade_id}/outcome")
+def update_trade_outcome_endpoint(trade_id: int, outcome: TradeOutcome, api_key: str = Security(get_api_key)):
+    """Record a trade's outcome and refresh analytics for its symbol."""
+    updated = repository.update_trade_outcome(
+        trade_id, outcome.exit_price, outcome.exit_reason, outcome.pips_gained, outcome.profit_loss_usd)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Trade not found")
+    repository._refresh_symbol_analytics(updated["symbol"])
+    return updated
+
+
+@app.get("/analytics/performance")
+def analytics_performance(api_key: str = Security(get_api_key)):
+    """Full performance report across all symbols."""
+    return analytics_engine.generate_performance_report()
+
+
+@app.get("/analytics/performance/{symbol}")
+def analytics_symbol(symbol: str, api_key: str = Security(get_api_key)):
+    """Performance stats for one symbol."""
+    return analytics_engine.compute_symbol_performance(symbol)
+
+
+@app.get("/analytics/factors")
+def analytics_factors(api_key: str = Security(get_api_key)):
+    """Confluence factor effectiveness, most impactful first."""
+    return {"factors": analytics_engine.compute_factor_effectiveness()}
+
+
+@app.get("/analytics/providers")
+def analytics_providers(api_key: str = Security(get_api_key)):
+    """Signals, win rate and average confidence per LLM provider."""
+    return analytics_engine.compute_provider_performance()
+
+
+@app.get("/analytics/thresholds")
+def analytics_thresholds(api_key: str = Security(get_api_key)):
+    """Adaptive minimum score and enabled flag for every symbol."""
+    return analytics_engine.get_all_thresholds()
+
+
+@app.post("/analytics/symbols/{symbol}/unpause")
+def analytics_unpause(symbol: str, api_key: str = Security(get_api_key)):
+    """Manual override: re-enable a paused symbol without waiting for the 7-day recovery."""
+    if not analytics_engine.unpause_symbol(symbol):
+        raise HTTPException(status_code=404, detail="Symbol has no analytics record")
+    return {"symbol": symbol.upper(), "status": "re-enabled", "message": "Manual override applied"}
+
+
+@app.post("/admin/db-migrate")
+def admin_db_migrate(force: bool = False, api_key: str = Security(get_api_key)):
+    """Re-run the legacy-file migration (skipped if already done unless ?force=true)."""
+    if not force and migration_done():
+        return {"status": "already_done",
+                "message": "Migration already completed. Pass ?force=true to re-run."}
+    r = run_and_record_migration()
+    return {"status": "complete" if not r["errors"] else "failed",
+            "records_found": r["records_found"], "records_inserted": r["records_inserted"],
+            "records_skipped": r["records_skipped"], "errors": r["errors"]}
+
+
+@app.post("/analytics/refresh")
+def analytics_refresh(api_key: str = Security(get_api_key)):
+    """Re-run all analytics computations."""
+    return analytics_engine.refresh_all()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PUBLIC ENDPOINTS (no API key required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -353,9 +541,20 @@ async def poll_position_event(symbol: str):
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
+    """Public health check: app uptime plus DB connectivity and migration status."""
+    db_state, migration = "unreachable", "unknown"
+    try:
+        db_get_one("SELECT 1 AS ok")
+        db_state = "connected"
+        migration = "completed" if migration_done() else "pending"
+    except Exception:
+        pass
     return {
-        "status": "ok",
+        "status": "ok" if db_state == "connected" else "degraded",
+        "db": db_state,
+        "migration": migration,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "uptime_seconds": int(time.time() - bot_status["server_start_time"]),
         "signals_tracked": len(latest_analysis),
         "pending_position_event_symbols": len(pending_position_events),

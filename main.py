@@ -44,6 +44,11 @@ from modules.trade_monitor import TradeMonitor
 from modules.indicator_engine import IndicatorEngine
 from modules.pattern_detector import PatternDetector
 from modules.risk_manager import RiskManager
+from analytics.engine import should_take_signal
+from db.connection import db_configured, test_connection
+from db.repository import insert_signal
+from db.schema import init_schema
+from db.signal_context import build_signal_dict
 from utils.helpers import load_config
 from utils.logger import get_logger, configure_from_config
 from utils.market_hours import (
@@ -321,6 +326,21 @@ class TradingBot:
         # Record signal time for cooldown
         self.last_signal_time[symbol] = datetime.now(timezone.utc)
 
+        # 5.9 Analytics feedback gate + DB signal log (fail-open if analytics/DB are down)
+        signal_id: Optional[int] = None
+        try:
+            signal_dict = build_signal_dict(signal, df, htf_context, symbol)
+            approved_gate, gate_reason = should_take_signal(signal_dict)
+            if not approved_gate:
+                log.info(f"[ANALYTICS GATE] Signal rejected: {gate_reason}")
+            signal_id = insert_signal(
+                signal_dict, source="LLM", gate_rejected=not approved_gate, gate_reason=gate_reason
+            )
+            if not approved_gate:
+                return  # logged with gate_rejected=1; never reaches risk/execution
+        except Exception as exc:
+            log.error(f"[DB] Analytics gate/signal logging failed, continuing without it: {exc}")
+
         # 6. Risk Management Evaluation
         approved, sizing = self.risk_manager.evaluate_signal(signal, df, symbol)
 
@@ -363,6 +383,7 @@ class TradingBot:
                 symbol, pnl, close_reason, close_order.price
             )
 
+        sizing.signal_id = signal_id
         order = self.execution_engine.place_order(sizing, current_price)
 
         if order.status == "filled":
@@ -750,19 +771,21 @@ def main():
     parser.add_argument("--timeframe", help="Override timeframe")
     args = parser.parse_args()
 
-    # Render web services expect a bound port; keep a tiny health endpoint open.
-    port = os.getenv("PORT")
-    if port and not args.backtest:
-        try:
-            start_health_server(int(port))
-        except Exception as exc:
-            log.warning(f"Failed to start health server on PORT={port}: {exc}")
-
     # Load Config
     config = load_config("config.yaml")
 
     # Configure Logging
     configure_from_config(config)
+
+    # Database: report status and ensure tables exist (non-fatal — file fallback otherwise)
+    if db_configured():
+        if test_connection():
+            try:
+                init_schema()
+            except Exception as exc:
+                log.critical(f"[DB] Schema init failed: {exc}")
+    else:
+        log.critical("[DB] DB_* environment variables not set — using file logging fallback")
 
     # Render web services expect a bound port; keep a tiny health endpoint open.
     # Do this after logging setup so bind failures are visible in logs.

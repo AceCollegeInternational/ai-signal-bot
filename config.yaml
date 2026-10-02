@@ -50,22 +50,27 @@ market_hours:
 
 # ─── AI Provider Configuration ─────────────────────────────────────────────
 ai:
-  primary_provider: "groq"       # "gemini" | "groq" | "claude"
+  primary_provider: "groq"       # "gemini" | "groq" | "deepseek" | "claude" (AI_PRIMARY env var overrides)
   fallback_enabled: true
   
   gemini:
-    model: "gemini-2.0-flash"
+    model: "gemini-2.5-flash"  # overridden by GEMINI_MODEL env var
     temperature: 0.1
-    max_tokens: 1000
+    max_tokens: 2000
     
-  groq:
-    model: "llama-3.3-70b-versatile"
+  deepseek:
+    model: "deepseek-chat"  # overridden by DEEPSEEK_MODEL env var; "deepseek-reasoner" = R1
     temperature: 0.1
-    max_tokens: 1000
+    max_tokens: 2000
+
+  groq:
+    model: "llama3-70b-8192"  # overridden by GROQ_MODEL env var
+    temperature: 0.1
+    max_tokens: 2000
 
   claude: # Backwards compatibility
     model: "claude-sonnet-4-20250514"
-    max_tokens: 1000
+    max_tokens: 2000
     temperature: 0.1
 
 fundamental_analysis:
